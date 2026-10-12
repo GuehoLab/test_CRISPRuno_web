@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CRISPRuno Web</title>
+<!-- cross-origin isolation for multi-threading on hosts that cannot set COOP/COEP headers (e.g. GitHub Pages); no-op when the server sends them -->
+<script src="coi-serviceworker.js"></script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+	<h1>CRISPRuno Web</h1>
+	<nav class="tabs"><a href="index.html" class="on">처음</a><a href="build.html">1. 인덱스 만들기</a><a href="crispruno.html">2. CRISPRuno</a></nav>
+	<p class="sub">CRISPRuno(단방향 앵커 증폭 시퀀싱 분석, clementlab/CRISPRuno 0.1.22)를 브라우저 안에서 실행합니다. 정렬은 bowtie2 대신 minibwa(WebAssembly)로 하고, Cas-OFFinder 검색은 빠져 있습니다. 데이터는 이 컴퓨터 밖으로 나가지 않습니다.</p>
+
+	<div class="hub">
+		<a href="build.html"><b>1. 인덱스 만들기</b>
+			reference FASTA → minibwa 인덱스(<span class="mono">.l2b</span> + <span class="mono">.mbw</span>). 한 번 만들어 저장해 두면 계속 다시 씁니다(인간 게놈 약 1–1.5시간).
+			CLI <span class="mono">minibwa index</span>로 만든 파일도 그대로 씁니다.</a>
+		<a href="crispruno.html"><b>2. CRISPRuno</b>
+			settings 파일 + FASTQ(R1/R2/UMI)로 prep → UMI → primer/adapter trimming → minibwa 정렬 → read 할당(translocation, large deletion/inversion, 분류) → CRISPResso 정량 → 요약을 단계별로 실행하고, SVG 그림이 든 HTML 리포트를 만듭니다.</a>
+	</div>
+
+	<section style="margin-top:16px">
+		<h2>환경</h2>
+		<table id="env"><tbody></tbody></table>
+		<p class="note">데스크톱 Chrome/Edge 권장. wasm64(Memory64)를 지원하면 4 GiB 한도 없이 더 빠른 설정으로 돌고, 아니면 wasm32로 돕니다. 인간 게놈은 RAM 16 GB 이상을 권장합니다.</p>
+	</section>
+</main>
+<script src="common.js"></script>
+<script>checkEnv();</script>
+</body>
+</html>

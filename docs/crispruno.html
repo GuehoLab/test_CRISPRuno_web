@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CRISPRuno Web</title>
+<!-- cross-origin isolation for multi-threading on hosts that cannot set COOP/COEP headers (e.g. GitHub Pages); no-op when the server sends them -->
+<script src="coi-serviceworker.js"></script>
+<link rel="stylesheet" href="style.css">
+<style>
+	textarea { width: 100%; min-height: 200px; font: 12px/1.45 var(--mono); padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); box-sizing: border-box; }
+	#steps td:first-child { width: 28px; }
+	.files td button { padding: 3px 9px; }
+	#report-frame { width: 100%; height: 900px; border: 1px solid var(--line); border-radius: 8px; background: #fff; margin-top: 10px; }
+	#summary-box { white-space: pre-wrap; font: 12px/1.45 var(--mono); }
+</style>
+</head>
+<body>
+<main>
+	<h1>CRISPRuno Web</h1>
+	<nav class="tabs"><a href="index.html">처음</a><a href="build.html">1. 인덱스 만들기</a><a href="crispruno.html" class="on">2. CRISPRuno</a></nav>
+	<p class="sub">CRISPRuno 0.1.22(clementlab)의 분석을 브라우저에서 단계별로 실행합니다: prep → UMI → primer/adapter trimming → minibwa 정렬 → read 할당 → CRISPResso 정량 → 요약·리포트.
+		bowtie2 대신 minibwa로 정렬하고, Cas-OFFinder 검색은 빠져 있습니다. 파일은 브라우저 저장소(OPFS)의 run 폴더에 원본과 같은 이름으로 남습니다.</p>
+
+	<section>
+		<h2>환경</h2>
+		<table id="env"><tbody></tbody></table>
+		<div class="grid" style="margin-top:10px">
+			<label for="engine">엔진</label>
+			<select id="engine"><option value="auto">자동 (지원되면 wasm64)</option><option value="wasm64">wasm64 (Memory64, ≤16 GiB)</option><option value="wasm32">wasm32 (≤4 GiB)</option></select>
+			<label for="threads">정렬 스레드</label><div><input type="number" id="threads" value="1" min="1" max="64" style="max-width:120px"> <span class="note" id="threads-note"></span></div>
+		</div>
+		<div class="row"><button id="btn-persist">저장소 persist 요청</button><span id="persist-msg" class="note"></span></div>
+		<div class="gauge" id="gauge" style="margin-top:12px"><div></div><span style="left:0%"></span></div>
+		<p class="note" id="gauge-txt">실행 중인 worker 없음</p>
+	</section>
+
+	<section>
+		<h2>1. Run과 settings</h2>
+		<div class="grid">
+			<label for="run-name">Run 이름 (root)</label><input type="text" id="run-name" placeholder="예: UDiTaS-1450-R-CL03-DE">
+			<label for="settings-file">settings 파일</label><input type="file" id="settings-file" accept=".txt,.tsv,.settings,*">
+		</div>
+		<p class="note">CRISPRuno settings 파일 형식(줄마다 <span class="mono">key&lt;TAB&gt;value</span>, <span class="mono">#</span> 주석)을 그대로 씁니다. 명령줄 옵션도 같은 형식의 줄로 적으면 됩니다(예: <span class="mono">keep_intermediate	True</span>).
+			파일 경로는 이름만 봅니다 — <span class="mono">fastq_r1/fastq_r2/fastq_umi/cut_region_annotation_file</span>은 아래에서 고른 파일 중에서 찾습니다. <span class="mono">genome/aligner_genome</span>은 무시하고 아래에서 고른 인덱스·FASTA를 씁니다.</p>
+		<textarea id="settings" spellcheck="false"></textarea>
+		<div id="settings-info" class="card"></div>
+		<details style="margin-top:10px"><summary>웹 전용 옵션</summary>
+			<div class="grid" style="margin-top:8px">
+				<label for="opts">minibwa map 옵션 (reads)</label><div><input type="text" id="opts" class="mono" value="-s 20 -m 20 --end-bonus=5"> <span class="note">bowtie2 <span class="mono">--very-sensitive-local</span> 대신. <span class="mono">-b MD</span>는 자동으로 붙습니다(MD 태그로 양끝 일치 길이를 봄). primer를 잘라낸 짧은 read(30 bp~)도 정렬되도록 최소 점수를 낮추고(<span class="mono">-s 20 -m 20</span>), read 끝의 mismatch를 bowtie2 local처럼 soft-clip하도록 끝 보너스를 낮춘 값(<span class="mono">--end-bonus=5</span>, minibwa 기본 10; 이 앱의 minibwa에 추가한 옵션)이 기본입니다.</span></div>
+				<label for="opts-loc">minibwa map 옵션 (primer/guide 위치)</label><div><input type="text" id="opts-loc" class="mono" value="-k 15 -m 15 -s 10"> <span class="note">bowtie2 <span class="mono">--end-to-end -c</span> 대신 primer와 guide 서열을 read로 정렬합니다(20 bp도 정렬되도록).</span></div>
+				<label for="batch">정렬 배치 (read 수)</label><input type="number" id="batch" value="20000" min="1000" step="1000">
+				<label for="fix-ids">read ID 공백 보정</label><label><input type="checkbox" id="fix-ids"> CRISPResso 단계에서 read 이름의 공백을 '_'로 바꿔 대조 (원본 0.1.22에서는 이름에 공백이 있으면 CRISPResso 분석 read가 0개가 됨)</label>
+			</div>
+		</details>
+	</section>
+
+	<section>
+		<h2>2. 입력 파일</h2>
+		<div class="grid">
+			<label for="fastqs">FASTQ 등 (.gz 가능, 여러 개)</label><input type="file" id="fastqs" multiple>
+			<label>Reference index</label>
+			<div>
+				<div class="choice" style="margin:0"><label><input type="radio" name="src" value="opfs" checked> 브라우저 저장소의 인덱스</label><label><input type="radio" name="src" value="file"> 인덱스 파일 (.l2b + .mbw)</label></div>
+				<select id="opfs-idx"></select>
+				<input type="file" id="idx-files" multiple accept=".l2b,.mbw" class="hidden">
+			</div>
+			<label for="fasta">Reference FASTA</label><div><input type="file" id="fasta" multiple accept=".fa,.fasta,.fna,.fai"> <span class="note">origin 서열, homology 검색(±30 bp), CRISPResso amplicon에 쓰입니다(<span class="mono">samtools faidx</span> 대신). .fai를 함께 고르면 색인 시간을 줄입니다. 비워 두면 인덱스의 .l2b에서 읽습니다(IUPAC 문자는 N).</span></div>
+		</div>
+		<div id="input-info" class="card"></div>
+	</section>
+
+	<section>
+		<h2>3. 실행</h2>
+		<table id="steps"><thead><tr><th></th><th>단계</th><th>원본 (CRISPRunoCore.py)</th><th>상태</th></tr></thead><tbody></tbody></table>
+		<div class="row"><button class="primary" id="btn-run">선택한 단계 실행</button><button id="btn-cancel" disabled>취소</button><span id="run-msg" class="note"></span></div>
+		<progress id="prog" value="0" max="1" class="hidden" style="margin-top:10px"></progress>
+		<p class="note">각 단계는 앞 단계가 run 폴더에 남긴 파일을 읽습니다(원본의 재사용 파일과 같은 방식). 한 단계만 다시 돌릴 수도 있습니다. 정렬기가 minibwa라 read 위치·MAPQ가 bowtie2와 조금 다를 수 있고, 같은 정렬(SAM)이 들어가면 나머지 단계의 출력 파일은 원본과 같도록 이식했습니다.</p>
+	</section>
+
+	<section>
+		<h2>4. 결과</h2>
+		<div class="row" style="margin-top:0"><label for="run-sel" class="note">Run</label><select id="run-sel" style="max-width:320px"></select><button id="btn-zip">결과 zip</button><button id="btn-report">리포트 새 창</button><button id="btn-del-run">run 삭제</button></div>
+		<div id="summary-box" class="card"></div>
+		<iframe id="report-frame" class="hidden" title="report"></iframe>
+		<details style="margin-top:10px"><summary>파일 목록</summary>
+			<table class="files" id="files"><thead><tr><th>파일</th><th class="num">크기</th><th></th></tr></thead><tbody></tbody></table>
+		</details>
+	</section>
+
+	<section>
+		<h2>로그</h2>
+		<pre id="log"></pre>
+	</section>
+</main>
+<script src="common.js"></script>
+<script src="lib/fflate.min.js"></script>
+<script src="lib/pyfmt.js"></script>
+<script src="cu/core.js"></script>
+<script src="cu/settings.js"></script>
+<script src="crispruno.js"></script>
+</body>
+</html>
