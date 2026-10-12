@@ -1,0 +1,19 @@
+--- a/map-main.c	2026-10-12 22:00:19.847604812 +0900
++++ b/map-main.c	2026-10-12 22:00:19.872122708 +0900
+@@ -452,6 +452,7 @@
+ 	{ "mmap",         ko_optional_argument, 313 },
+ 	{ "xa-ratio",     ko_required_argument, 314 },
+ 	{ "outs",         ko_required_argument, 315 },
++	{ "end-bonus",    ko_required_argument, 316 },
+ 	{ "dbg-aln-seq",  ko_no_argument,       601 },
+ 	{ "dbg-anchor",   ko_no_argument,       602 },
+ 	{ "dbg-seed",     ko_no_argument,       603 },
+@@ -618,6 +619,8 @@
+ 			if (o.arg != 0 && strcmp(o.arg, "lite") == 0) mmap_preload = 0;
+ 		} else if (c == 314 || c == 315) { // --outs or --xa-ratio
+ 			mo.out_s = atof(o.arg);
++		} else if (c == 316) { // --end-bonus: score bonus for reaching a read end (sr/adap preset: 10); lower values soft-clip end mismatches like a local aligner
++			mo.end_bonus = atoi(o.arg);
+ 		} else if (c == 601) { // --dbg-aln-seq
+ 			kom_dbg_flag |= MB_DBG_ALN_SEQ;
+ 		} else if (c == 602) { // --dbg-anchor

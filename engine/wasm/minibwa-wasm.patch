@@ -1,0 +1,990 @@
+--- a/l2bit.h
++++ b/l2bit.h
+@@ -29,8 +29,14 @@
+ 	char *cat_name, *cat_comm;
+ 	void *mmap; // mmap pointer
+ 	size_t mmap_len; // mmap length (for munmap)
++	void *pac_fp;    // [wasm] lazy mode: pac[] stays on disk/OPFS and is read on demand
++	uint64_t pac_off; // [wasm] byte offset of pac[] in the .l2b file
+ } l2b_t;
+ 
++extern int l2b_lazy_pac; // [wasm] if non-zero, l2b_load() does not load pac[] into memory
++extern int l2b_skip_mask; // [wasm] if non-zero, l2b_load() skips the soft-mask intervals
++extern int64_t l2b_cache_bytes, l2b_cache_hit, l2b_cache_miss; // [wasm] page cache for lazy pac[]
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+--- a/l2bit.c
++++ b/l2bit.c
+@@ -1,11 +1,58 @@
++#define _POSIX_C_SOURCE 200809L // [wasm] for pread() and fseeko()
+ #include <zlib.h>
+ #include <stdio.h>
+ #include <assert.h>
++#include <unistd.h>
+ #include "kommon.h"
+ #include "l2bit.h"
+ #include "kseq.h"
+ KSEQ_INIT(gzFile, gzread)
+ 
++int l2b_lazy_pac = 0;
++int l2b_skip_mask = 0; // [wasm] load pac[] but not the soft-mask intervals (not used by mapping)
++int64_t l2b_cache_bytes = 256LL<<20; // [wasm] size of the page cache used in lazy mode
++int64_t l2b_cache_hit = 0, l2b_cache_miss = 0;
++
++/* [wasm] Lazy mode: pac[] stays in the .l2b file (e.g. on OPFS, where each read
++ * costs ~0.05-0.5 ms) and is accessed through a 2-way set-associative cache of
++ * 64 KB pages. Reads at the same loci (e.g. GUIDE-seq sites) mostly hit. */
++#define L2B_PAGE_WORDS 8192
++static uint64_t *l2b_cdata = 0;
++static int64_t *l2b_ctag = 0;
++static uint8_t *l2b_clru = 0;
++static int64_t l2b_cn_set = 0;
++
++static const uint64_t *l2b_lazy_page(const l2b_t *l2b, uint64_t page)
++{
++	int64_t set, s0, victim;
++	uint64_t n_words;
++	if (l2b_cn_set == 0) { // initialize; never larger than pac[] itself
++		uint64_t n_page = (l2b->n_pac + L2B_PAGE_WORDS - 1) / L2B_PAGE_WORDS;
++		int64_t n = l2b_cache_bytes / (L2B_PAGE_WORDS * 8);
++		if (n < 2) n = 2;
++		if ((uint64_t)n > n_page + 1) n = n_page + 1;
++		l2b_cn_set = (n + 1) / 2;
++		l2b_cdata = (uint64_t*)malloc(l2b_cn_set * 2 * L2B_PAGE_WORDS * 8);
++		l2b_ctag = (int64_t*)malloc(l2b_cn_set * 2 * sizeof(int64_t));
++		l2b_clru = (uint8_t*)calloc(l2b_cn_set, 1);
++		for (set = 0; set < l2b_cn_set * 2; ++set) l2b_ctag[set] = -1;
++	}
++	set = page % l2b_cn_set, s0 = set * 2;
++	if (l2b_ctag[s0] == (int64_t)page) { l2b_clru[set] = 1; ++l2b_cache_hit; return &l2b_cdata[s0 * L2B_PAGE_WORDS]; }
++	if (l2b_ctag[s0+1] == (int64_t)page) { l2b_clru[set] = 0; ++l2b_cache_hit; return &l2b_cdata[(s0+1) * L2B_PAGE_WORDS]; }
++	++l2b_cache_miss;
++	victim = s0 + l2b_clru[set]; // l2b_clru[set] is the least recently used way
++	l2b_clru[set] = !l2b_clru[set];
++	n_words = l2b->n_pac - page * L2B_PAGE_WORDS;
++	if (n_words > L2B_PAGE_WORDS) n_words = L2B_PAGE_WORDS;
++	if (pread(fileno((FILE*)l2b->pac_fp), &l2b_cdata[victim * L2B_PAGE_WORDS], n_words * 8, (off_t)(l2b->pac_off + page * L2B_PAGE_WORDS * 8)) != (ssize_t)(n_words * 8)) {
++		fprintf(stderr, "[E::%s] failed to read pac[] from disk\n", __func__);
++		abort();
++	}
++	l2b_ctag[victim] = page;
++	return &l2b_cdata[victim * L2B_PAGE_WORDS];
++}
++
+ static int64_t l2b_pos2cid(const l2b_t *l2b, int64_t s, int64_t len, int64_t *cst)
+ {
+ 	int64_t lo = 0, hi = l2b->n_ctg, mid;
+@@ -58,10 +105,21 @@
+ 	ctg = &l2b->ctg[tid];
+ 	if (st < 0) st = 0;
+ 	if (en > ctg->len) en = ctg->len;
++	if (st >= en) return en - st;
+ 	st += ctg->off;
+ 	en += ctg->off;
+-	for (i = st; i < en; ++i)
+-		seq[i - st] = l2b_get0(l2b, i);
++	if (l2b->pac) {
++		for (i = st; i < en; ++i)
++			seq[i - st] = l2b_get0(l2b, i);
++	} else { // [wasm] lazy mode: read through the page cache
++		uint64_t cur = (uint64_t)-1;
++		const uint64_t *p = 0;
++		for (i = st; i < en; ++i) {
++			uint64_t w = (uint64_t)i >> 5, page = w / L2B_PAGE_WORDS;
++			if (page != cur) p = l2b_lazy_page(l2b, page), cur = page;
++			seq[i - st] = p[w - page * L2B_PAGE_WORDS] >> ((i & 31) << 1) & 3;
++		}
++	}
+ 	// retrieve ambiguous bases
+ 	aid = l2b_getambi(l2b, tid, st - ctg->off, en - ctg->off, &n_ambi);
+ 	if (aid >= 0) {
+@@ -216,6 +274,9 @@
+ 
+ 	fp = fn == 0 || strcmp(fn, "-") == 0? gzdopen(0, "r") : gzopen(fn, "r");
+ 	if (fp == 0) return 0;
++#if defined(__wasi__) || defined(__EMSCRIPTEN__)
++	gzbuffer(fp, 1<<20); // [wasm] fewer, larger reads
++#endif
+ 	ks = kseq_init(fp);
+ 	l2b = kom_calloc(l2b_t, 1);
+ 	while (kseq_read(ks) >= 0) {
+@@ -234,6 +295,7 @@
+ 		free(l2b->ctg); // ctg[] is always heap-allocated
+ 		kom_munmap(l2b->mmap, l2b->mmap_len);
+ 	} else {
++		if (l2b->pac_fp) fclose((FILE*)l2b->pac_fp);
+ 		free(l2b->cat_name); free(l2b->cat_comm);
+ 		free(l2b->pac); free(l2b->ambi); free(l2b->mask); free(l2b->ctg);
+ 	}
+@@ -303,13 +365,19 @@
+ 	}
+ 	if (off != l2b->tot_len) goto load_failure;
+ 	l2b->ambi = kom_malloc(l2b_intv_t, l2b->n_ambi);
+-	l2b->mask = kom_malloc(l2b_intv_t, l2b->n_mask);
+-	l2b->pac = kom_malloc(uint64_t, l2b->n_pac);
++	l2b->pac = l2b_lazy_pac && fp != stdin? 0 : kom_malloc(uint64_t, l2b->n_pac);
++	l2b->mask = l2b->pac && !l2b_skip_mask? kom_malloc(l2b_intv_t, l2b->n_mask) : 0; // [wasm] lazy mode: soft-mask intervals are not used by mapping (T2T: ~270 MB)
+ 	l2b->cat_name = kom_malloc(char, len_name);
+ 	l2b->cat_comm = kom_malloc(char, len_comm);
+ 	fread(l2b->ambi, 16, l2b->n_ambi, fp);
+-	fread(l2b->mask, 16, l2b->n_mask, fp);
+-	fread(l2b->pac, 8, l2b->n_pac, fp);
++	if (l2b->pac) {
++		if (l2b->mask) fread(l2b->mask, 16, l2b->n_mask, fp);
++		else fseeko(fp, (off_t)(l2b->n_mask * 16), SEEK_CUR); // [wasm] l2b_skip_mask
++		fread(l2b->pac, 8, l2b->n_pac, fp);
++	} else { // [wasm] lazy mode: remember where pac[] is and skip it
++		l2b->pac_off = 64 + l2b->n_ctg * 8 + (l2b->n_ambi + l2b->n_mask) * 16;
++		fseeko(fp, (off_t)(l2b->pac_off + l2b->n_pac * 8), SEEK_SET);
++	}
+ 	fread(l2b->cat_name, 1, len_name, fp);
+ 	fread(l2b->cat_comm, 1, len_comm, fp);
+ 	p_name = l2b->cat_name, p_comm = l2b->cat_comm;
+@@ -321,10 +389,11 @@
+ 		p_comm += *p_comm? strlen(p_comm) + 1 : 1;
+ 	}
+ 	if (p_name - l2b->cat_name != len_name || p_comm - l2b->cat_comm != len_comm) goto load_failure;
+-	if (fp != stdin) fclose(fp);
++	if (l2b->pac == 0) l2b->pac_fp = fp; // [wasm] keep the file open for on-demand reads
++	else if (fp != stdin) fclose(fp);
+ 	return l2b;
+ load_failure:
+-	if (fp != stdin) fclose(fp);
++	if (fp != stdin && l2b->pac_fp != fp) fclose(fp);
+ 	l2b_destroy(l2b);
+ 	return 0;
+ }
+--- a/bwt.h
++++ b/bwt.h
+@@ -68,6 +68,7 @@
+ int64_t mb_bwt_smem(const mb_bwt_t *f, uint32_t len, const uint8_t *q, int64_t x, int64_t min_len, int64_t min_occ, mb_sai_t *p);
+ void mb_bwt_smem_batch(void *km, const mb_bwt_t *bwt, int32_t n, mb_smem_entry_t *a);
+ 
++extern int mb_n_threads; // [par] threads for mb_bwt_gen_sa() and bwtgen
+ void mb_bwt_gen_sa(mb_bwt_t *bwt, uint32_t sa_bit);
+ uint64_t mb_bwt_sa(const mb_bwt_t *bwt, uint64_t k);
+ void mb_bwt_sa_batch(void *km, const mb_bwt_t *bwt, int64_t n, uint64_t *x);
+--- a/bwt.c
++++ b/bwt.c
+@@ -6,6 +6,7 @@
+ #include "kommon.h"
+ #include "kalloc.h"
+ #include "bwt.h"
++#include "kthread.h"
+ 
+ /********************
+  * Basic operations *
+@@ -470,6 +471,76 @@
+ 	return k == bwt->primary? 0 : x;
+ }
+ 
++int mb_n_threads = 1; // [par] threads for SA sampling (mb_bwt_gen_sa) and bwtgen
++
++/* [par] Parallel SA sampling.
++ * The serial version walks the LF cycle once from rank 0 (the sentinel) and records SA[r] for
++ * every sampled rank r. Here the cycle is cut at every rank that is a multiple of 2^cut_shift:
++ * each piece is walked by one task, which stores (piece id << 40 | steps from the piece start)
++ * in place of the SA value. The pieces are then chained from rank 0, whose text position is
++ * known (seq_len), and a last pass turns the relative values into positions. Uses no memory
++ * beyond the SA array and three small per-piece arrays; the result is identical. */
++#define GENSA_OFF_BITS 40
++typedef struct {
++	mb_bwt_t *bwt;
++	int cut_shift;
++	uint64_t *len, *pos;
++	uint32_t *next;
++} gensa_aux_t;
++
++static void gensa_walk(void *data, long k, int tid)
++{
++	gensa_aux_t *g = (gensa_aux_t*)data;
++	mb_bwt_t *bwt = g->bwt;
++	uint64_t isa = (uint64_t)k << g->cut_shift, off = 0;
++	uint64_t mask = (1ULL<<bwt->sa_bit) - 1, cut_mask = (1ULL<<g->cut_shift) - 1;
++	(void)tid;
++	do {
++		if ((isa & mask) == 0) bwt->sa[isa >> bwt->sa_bit] = (uint64_t)k << GENSA_OFF_BITS | off;
++		++off;
++		isa = bwt_invPsi(bwt, isa);
++	} while (isa & cut_mask);
++	g->len[k] = off, g->next[k] = isa >> g->cut_shift;
++}
++
++static void gensa_fix(void *data, long k, int tid)
++{
++	gensa_aux_t *g = (gensa_aux_t*)data;
++	mb_bwt_t *bwt = g->bwt;
++	uint64_t i, st = (uint64_t)k << 20, en = st + (1ULL<<20);
++	(void)tid;
++	if (en > bwt->n_sa) en = bwt->n_sa;
++	for (i = st; i < en; ++i) {
++		uint64_t v = bwt->sa[i];
++		bwt->sa[i] = g->pos[v >> GENSA_OFF_BITS] - (v & ((1ULL<<GENSA_OFF_BITS) - 1));
++	}
++}
++
++static void mb_bwt_gen_sa_par(mb_bwt_t *bwt, uint32_t sa_bit, int n_threads)
++{
++	gensa_aux_t g;
++	uint64_t n_cut, k, j, p, tot = 0;
++	int cut_shift = 0;
++	while ((bwt->seq_len >> cut_shift) > (uint64_t)n_threads * 4096) ++cut_shift; // ~4096 pieces per thread
++	if (cut_shift < (int)sa_bit) cut_shift = sa_bit; // so that each piece covers at least one sampled rank on average
++	n_cut = (bwt->seq_len >> cut_shift) + 1; // ranks 0, 2^s, 2*2^s, ... <= seq_len
++	kom_assert(n_cut < 1ULL<<24 && bwt->seq_len < 1ULL<<GENSA_OFF_BITS, "genome too large for parallel SA sampling");
++	g.bwt = bwt, g.cut_shift = cut_shift;
++	g.len = kom_calloc(uint64_t, n_cut);
++	g.pos = kom_calloc(uint64_t, n_cut);
++	g.next = kom_calloc(uint32_t, n_cut);
++	kt_for(n_threads, gensa_walk, &g, n_cut);
++	for (k = 0, j = 0, p = bwt->seq_len; k < n_cut; ++k) { // chain the pieces along the cycle; rank 0 is at position seq_len
++		g.pos[j] = p;
++		p -= g.len[j], tot += g.len[j];
++		j = g.next[j];
++		if (j == 0) break;
++	}
++	kom_assert(j == 0 && k + 1 == n_cut && tot == bwt->seq_len + 1, "inconsistent LF cycle in parallel SA sampling");
++	kt_for(n_threads, gensa_fix, &g, (long)((bwt->n_sa + (1ULL<<20) - 1) >> 20));
++	free(g.len); free(g.pos); free(g.next);
++}
++
+ // bwt->bwt and bwt->occ must be precalculated
+ void mb_bwt_gen_sa(mb_bwt_t *bwt, uint32_t sa_bit)
+ {
+@@ -480,6 +551,11 @@
+ 	bwt->sa_bit = sa_bit;
+ 	bwt->n_sa = (bwt->seq_len + (1<<sa_bit)) >> sa_bit;
+ 	bwt->sa = kom_calloc(uint64_t, bwt->n_sa);
++	if (mb_n_threads > 1) { // [par]
++		mb_bwt_gen_sa_par(bwt, sa_bit, mb_n_threads);
++		bwt->sa[0] = (uint64_t)-1;
++		return;
++	}
+ 
+ 	// calculate SA value
+ 	isa = 0, sa = bwt->seq_len, mask = (1ULL<<sa_bit) - 1;
+@@ -596,7 +672,19 @@
+ 	uint64_t offset = 0;
+ 	while (size) {
+ 		int x = bufsize < size? bufsize : size;
+-		if ((x = fread(a + offset, 1, x, fp)) == 0) break;
++		if ((x = fread((uint8_t*)a + offset, 1, x, fp)) == 0) break;
++		size -= x; offset += x;
++	}
++	return offset;
++}
++
++static uint64_t write_huge(FILE *fp, uint64_t size, const void *a)
++{ // write in 16MB chunks; a single huge fwrite() may overflow 32-bit lengths (e.g. in wasm32)
++	const uint64_t bufsize = 0x1000000;
++	uint64_t offset = 0;
++	while (size) {
++		uint64_t x = bufsize < size? bufsize : size;
++		if (fwrite((const uint8_t*)a + offset, 1, x, fp) != x) break;
+ 		size -= x; offset += x;
+ 	}
+ 	return offset;
+@@ -633,10 +721,10 @@
+ 	fwrite(&bwt->sa_bit, 4, 1, fp);
+ 	fwrite(&bwt->primary, 8, 1, fp);
+ 	fwrite(&bwt->L2[1], 8, 4, fp);
+-	fwrite(bwt->data, 8, bwt->data_len, fp);
++	write_huge(fp, bwt->data_len << 3, bwt->data);
+ 	fwrite(&bwt->n_sa, 8, 1, fp);
+ 	if (bwt->sa_bit != (uint32_t)-1 && bwt->n_sa > 0 && bwt->sa)
+-		fwrite(bwt->sa, 8, bwt->n_sa, fp);
++		write_huge(fp, bwt->n_sa << 3, bwt->sa);
+ 	fclose(fp);
+ 	return 0;
+ }
+@@ -672,7 +760,7 @@
+ 			return NULL;
+ 		}
+ 		bwt->sa = kom_malloc(uint64_t, bwt->n_sa);
+-		fread(bwt->sa, 8, bwt->n_sa, fp);
++		read_huge(fp, bwt->n_sa << 3, bwt->sa);
+ 	}
+ 	fclose(fp);
+ 	return bwt;
+--- a/kommon.c
++++ b/kommon.c
+@@ -309,9 +309,14 @@
+ 
+ long kom_peakrss(void)
+ {
++#if defined(__wasi__) || defined(__EMSCRIPTEN__) // [wasm] no ru_maxrss in WASI; linear memory never shrinks, so its size is the peak
++	return (long)((unsigned long)__builtin_wasm_memory_size(0) * 65536UL);
++#else
+ 	struct rusage r;
+ 	getrusage(RUSAGE_SELF, &r);
+-#ifdef __linux__
++#endif
++#if defined(__wasi__) || defined(__EMSCRIPTEN__)
++#elif defined(__linux__)
+ 	return r.ru_maxrss * 1024;
+ #else
+ 	return r.ru_maxrss;
+--- a/kommon.h
++++ b/kommon.h
+@@ -17,7 +17,7 @@
+ 	} while (0)
+ 
+ #define kom_roundup32(x) (--(x), (x)|=(x)>>1, (x)|=(x)>>2, (x)|=(x)>>4, (x)|=(x)>>8, (x)|=(x)>>16, ++(x))
+-#define kom_roundup64(x) (--(x), (x)|=(x)>>1, (x)|=(x)>>2, (x)|=(x)>>4, (x)|=(x)>>8, (x)|=(x)>>16, (x)|=(x)>>32, ++(x))
++#define kom_roundup64(x) (--(x), (x)|=(x)>>1, (x)|=(x)>>2, (x)|=(x)>>4, (x)|=(x)>>8, (x)|=(x)>>16, (x)|=(x)>>16>>16, ++(x)) // [wasm] >>16>>16 avoids UB when x is a 32-bit size_t
+ 
+ #define kom_reverse(type, n, a) do { \
+ 		size_t i; \
+@@ -49,8 +49,8 @@
+ int64_t kom_parse_num(const char *str, char **q);
+ void kom_panic(const char *func, const char *msg);
+ 
+-int64_t kom_sprintf_lite(kstring_t *s, const char *fmt, ...);
+-int64_t km_sprintf_lite(void *km, kstring_t *s, const char *fmt, ...);
++int64_t kom_sprintf_lite(kstring_t *s, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
++int64_t km_sprintf_lite(void *km, kstring_t *s, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+ 
+ double kom_cputime(void);
+ double kom_realtime(void); // call at the beginning to reset the timer
+--- a/kseq.h
++++ b/kseq.h
+@@ -95,7 +95,7 @@
+ #endif
+ 
+ #ifndef kroundup64
+-#define kroundup64(x) (--(x), (x)|=(x)>>1, (x)|=(x)>>2, (x)|=(x)>>4, (x)|=(x)>>8, (x)|=(x)>>16, (x)|=(x)>>32, ++(x))
++#define kroundup64(x) (--(x), (x)|=(x)>>1, (x)|=(x)>>2, (x)|=(x)>>4, (x)|=(x)>>8, (x)|=(x)>>16, (x)|=(x)>>16>>16, ++(x)) // [wasm] >>16>>16 avoids UB when x is a 32-bit size_t
+ #endif
+ 
+ #define __KS_GETUNTIL(SCOPE, __read) \
+--- a/format.c
++++ b/format.c
+@@ -109,7 +109,7 @@
+ 	kom_sprintf_lite(str, "@HD\tVN:1.6\tSO:unsorted\tGO:query\n");
+ 	if (idx)
+ 		for (i = 0; i < idx->n_ctg; ++i)
+-			kom_sprintf_lite(str, "@SQ\tSN:%s\tLN:%ld\n", idx->ctg[i].name, idx->ctg[i].len);
++			kom_sprintf_lite(str, "@SQ\tSN:%s\tLN:%ld\n", idx->ctg[i].name, (long)idx->ctg[i].len);
+ 	if (rg) ret = sam_write_rg_line(str, rg);
+ 	kom_sprintf_lite(str, "@PG\tID:minibwa\tPN:minibwa");
+ 	if (ver) kom_sprintf_lite(str, "\tVN:%s", ver);
+@@ -235,7 +235,7 @@
+ 		} else kom_sprintf_lite(s, "\t*\t0\t0\t*");
+ 	} else {
+ 		this_tid = r->tid, this_pos = r->ts;
+-		kom_sprintf_lite(s, "\t%s\t%d\t%d\t", l2b->ctg[r->tid].name, r->ts+1, r->mapq);
++		kom_sprintf_lite(s, "\t%s\t%d\t%d\t", l2b->ctg[r->tid].name, (int)r->ts+1, r->mapq);
+ 		write_sam_cigar(s, flag, 0, t->l_seq, r, opt->flag);
+ 	}
+ 
+@@ -251,16 +251,16 @@
+ 				}
+ 				kom_sprintf_lite(s, "\t=\t");
+ 			} else kom_sprintf_lite(s, "\t%s\t", l2b->ctg[r_next->tid].name);
+-			kom_sprintf_lite(s, "%d\t", r_next->ts + 1);
++			kom_sprintf_lite(s, "%d\t", (int)r_next->ts + 1);
+ 		} else if (r_next) { // && this_tid < 0
+-			kom_sprintf_lite(s, "\t%s\t%d\t", l2b->ctg[r_next->tid].name, r_next->ts + 1);
++			kom_sprintf_lite(s, "\t%s\t%d\t", l2b->ctg[r_next->tid].name, (int)r_next->ts + 1);
+ 		} else if (this_tid >= 0) { // && r_next == NULL. In this case, mate is unmapped and placed at this segment's primary alignment
+ 			const mb_hit_t *r_pri;
+ 			r_pri = get_sam_pri(n_h, h);
+ 			if (r->tid == r_pri->tid)
+-				kom_sprintf_lite(s, "\t=\t%d\t", r_pri->ts + 1);
++				kom_sprintf_lite(s, "\t=\t%d\t", (int)r_pri->ts + 1);
+ 			else
+-				kom_sprintf_lite(s, "\t%s\t%d\t", l2b->ctg[r_pri->tid].name, r_pri->ts + 1);
++				kom_sprintf_lite(s, "\t%s\t%d\t", l2b->ctg[r_pri->tid].name, (int)r_pri->ts + 1);
+ 		} else kom_sprintf_lite(s, "\t*\t0\t"); // neither has coordinates
+ 		if (tlen > 0) ++tlen;
+ 		else if (tlen < 0) --tlen;
+@@ -316,7 +316,7 @@
+ 					else l_M = q->te - q->ts, l_I = (q->qe - q->qs) - l_M;
+ 					clip5 = q->rev? t->l_seq - q->qe : q->qs;
+ 					clip3 = q->rev? q->qs : t->l_seq - q->qe;
+-					kom_sprintf_lite(s, "%s,%d,%c,", l2b->ctg[q->tid].name, q->ts+1, "+-"[q->rev]);
++					kom_sprintf_lite(s, "%s,%d,%c,", l2b->ctg[q->tid].name, (int)q->ts+1, "+-"[q->rev]);
+ 					if (clip5) kom_sprintf_lite(s, "%dS", clip5);
+ 					if (l_M) kom_sprintf_lite(s, "%dM", l_M);
+ 					if (l_I) kom_sprintf_lite(s, "%dI", l_I);
+@@ -336,7 +336,7 @@
+ 					for (i = 0; i < n_h; ++i) {
+ 						const mb_hit_t *q = &h[i];
+ 						if (i != r - h && q->parent == r - h && q->p->dp_max >= (double)opt->out_s * r->p->dp_max) {
+-							kom_sprintf_lite(s, "%s,%c%d,", l2b->ctg[q->tid].name, "+-"[q->rev], q->ts+1);
++							kom_sprintf_lite(s, "%s,%c%d,", l2b->ctg[q->tid].name, "+-"[q->rev], (int)q->ts+1);
+ 							write_sam_cigar(s, 0, 0, t->l_seq, q, opt->flag);
+ 							kom_sprintf_lite(s, ",%d;", q->blen - q->mlen + q->p->n_ambi);
+ 						}
+--- a/fastmap.c
++++ b/fastmap.c
+@@ -35,7 +35,7 @@
+ static void write_intv(const mb_idx_t *idx, const mb_sai_t *p, int32_t max_size_out, uint64_t *sa, kstring_t *out)
+ {
+ 	int64_t len;
+-	kom_sprintf_lite(out, "EM\t%ld\t%ld\t%ld", p->info>>32, p->info&0xffffffffull, p->size);
++	kom_sprintf_lite(out, "EM\t%ld\t%ld\t%ld", (long)(p->info>>32), (long)(p->info&0xffffffffull), (long)p->size);
+ 	len = (p->info&0xffffffffull) - (p->info>>32);
+ 	if (p->size <= max_size_out) {
+ 		int64_t j, n_sa = p->size;
+@@ -47,7 +47,7 @@
+ 			int64_t cid, cst;
+ 			cid = l2b_intv2cid(idx->l2b, sa[j], sa[j] + len, &cst, &rev);
+ 			if (cid < 0) kom_sprintf_lite(out, "\t.");
+-			else kom_sprintf_lite(out, "\t%s:%c%ld", idx->l2b->ctg[cid].name, "+-"[rev], cst + 1);
++			else kom_sprintf_lite(out, "\t%s:%c%ld", idx->l2b->ctg[cid].name, "+-"[rev], (long)(cst + 1));
+ 		}
+ 	} else kom_sprintf_lite(out, "\t*");
+ 	kom_sprintf_lite(out, "\n");
+--- a/bseq.c
++++ b/bseq.c
+@@ -46,6 +46,9 @@
+ 	gzFile f;
+ 	f = fn && strcmp(fn, "-")? gzopen(fn, "r") : gzdopen(0, "r");
+ 	if (f == 0) return 0;
++#if defined(__wasi__) || defined(__EMSCRIPTEN__)
++	gzbuffer(f, 1<<20); // [wasm] fewer, larger reads (each read is a JS call)
++#endif
+ 	fp = (mb_bseq_file_t*)calloc(1, sizeof(mb_bseq_file_t));
+ 	fp->fp = f;
+ 	fp->ks = kseq_init(fp->fp);
+@@ -158,6 +161,35 @@
+ 	}
+ 	*n_ = a.n;
+ 	return a.a;
++}
++
++mb_bseq1_t *mb_bseq_read_frag_n(int n_fp, mb_bseq_file_t **fp, int64_t max_rec, int with_qual, int with_comment, int *n_)
++{ // like mb_bseq_read_frag() but stops after max_rec records from each file
++	int i;
++	int64_t n_rec = 0;
++	kvec_t(mb_bseq1_t) a = {0,0,0};
++	*n_ = 0;
++	if (n_fp < 1) return 0;
++	while (n_rec < max_rec) {
++		int n_read = 0;
++		for (i = 0; i < n_fp; ++i)
++			if (kseq_read(fp[i]->ks) >= 0)
++				++n_read;
++		if (n_read < n_fp) {
++			if (n_read > 0)
++				fprintf(stderr, "[W::%s]\033[1;31m query files have different number of records; extra records skipped.\033[0m\n", __func__);
++			break;
++		}
++		if (a.m == 0) kv_resize(mb_bseq1_t, a, 256);
++		for (i = 0; i < n_fp; ++i) {
++			mb_bseq1_t *s;
++			kv_pushp(mb_bseq1_t, a, &s);
++			kseq2bseq(fp[i]->ks, s, with_qual, with_comment);
++		}
++		++n_rec;
++	}
++	*n_ = a.n;
++	return a.a;
+ }
+ 
+ int mb_bseq_eof(mb_bseq_file_t *fp)
+--- a/bseq.h
++++ b/bseq.h
+@@ -21,6 +21,7 @@
+ void mb_bseq_close(mb_bseq_file_t *fp);
+ mb_bseq1_t *mb_bseq_read(mb_bseq_file_t *fp, int64_t chunk_size, int with_qual, int with_comment, int frag_mode, int min_cnt, int64_t max_chunk_size, int *n_);
+ mb_bseq1_t *mb_bseq_read_frag(int n_fp, mb_bseq_file_t **fp, int64_t chunk_size, int with_qual, int with_comment, int *n_);
++mb_bseq1_t *mb_bseq_read_frag_n(int n_fp, mb_bseq_file_t **fp, int64_t max_rec, int with_qual, int with_comment, int *n_);
+ int mb_bseq_eof(mb_bseq_file_t *fp);
+ 
+ static inline int mb_qname_len(const char *s)
+--- a/map-main.c
++++ b/map-main.c
+@@ -20,6 +20,7 @@
+ 	mb_bseq_file_t **fp;
+ 	const mb_idx_t *idx;
+ 	FILE *fp_out;
++	int64_t max_reads; // [batch API] if >0, read this many records per input file per batch instead of mb_size bases
+ } pipeline_t;
+ 
+ typedef struct {
+@@ -121,7 +122,10 @@
+ 		int frag_mode = (p->n_fp > 1 || !!(opt->flag & MB_F_PE));
+         step_t *s;
+         s = kom_calloc(step_t, 1);
+-		if (p->n_fp > 1) s->seq = mb_bseq_read_frag(p->n_fp, p->fp, p->mb_size, with_qual, with_comment, &s->n_seq);
++		if (p->max_reads > 0) { // [batch API] fixed number of records per batch
++			if (p->n_fp > 1) s->seq = mb_bseq_read_frag_n(p->n_fp, p->fp, p->max_reads, with_qual, with_comment, &s->n_seq);
++			else s->seq = mb_bseq_read(p->fp[0], 1, with_qual, with_comment, frag_mode, p->max_reads, INT64_MAX, &s->n_seq);
++		} else if (p->n_fp > 1) s->seq = mb_bseq_read_frag(p->n_fp, p->fp, p->mb_size, with_qual, with_comment, &s->n_seq);
+ 		else s->seq = mb_bseq_read(p->fp[0], p->mb_size, with_qual, with_comment, frag_mode, min_read_cnt, opt->max_mb_size, &s->n_seq);
+ 		if (s->seq) {
+ 			int32_t sb_len, sb_off;
+@@ -140,7 +144,7 @@
+ 			s->hit = kom_calloc(mb_hit_t*, s->n_seq);
+ 			// set seg_cnt[] and seg_off[]
+ 			for (i = 1, j = 0; i <= s->n_seq; ++i) {
+-				if (i == s->n_seq || !frag_mode || !mb_qname_same(s->seq[i-1].name, s->seq[i].name)) {
++				if (i == s->n_seq || !frag_mode || i - j == 2 || !mb_qname_same(s->seq[i-1].name, s->seq[i].name)) { // [wasm] i - j == 2: a repeated read name (e.g. the same pair twice in a row) starts a new fragment instead of failing the assert
+ 					assert(i - j <= 2);
+ 					s->seg_cnt[s->n_frag] = i - j;
+ 					s->seg_off[s->n_frag++] = j;
+@@ -281,6 +285,9 @@
+ 	memset(&pl, 0, sizeof(pipeline_t));
+ 	pl.fp_out = fn_out == 0 || strcmp(fn_out, "-") == 0? stdout : fopen(fn_out, "wb");
+ 	if (pl.fp_out == 0) return -1;
++#if defined(__wasi__) || defined(__EMSCRIPTEN__)
++	{ static char obuf[4<<20]; setvbuf(pl.fp_out, obuf, _IOFBF, sizeof(obuf)); } // [wasm] fewer, larger writes (musl ignores the size if buf is NULL)
++#endif
+ 	if (hdr) fputs(hdr, pl.fp_out);
+ 	pl.n_fp = n;
+ 	pl.fp = mb_open_bseqs(pl.n_fp, fn);
+@@ -298,6 +305,105 @@
+ 	return 0;
+ }
+ 
++#ifdef MB_BATCH_API
++/*************************************************************************
++ * Batch API: load the index once, then map N records per call.          *
++ * Used by the WebAssembly align tool (one call per batch from JS).      *
++ * Output is identical to `map` when the CLI batches are the same, e.g.  *
++ * 2x150bp pairs with 10000 records per batch == `map -K 3000000`.       *
++ *************************************************************************/
++
++int mb_batch_keep = 0;
++static struct {
++	mb_opt_t opt;
++	mb_idx_t *idx;
++	char *hdr;
++	int32_t n_fn, opened;
++	char **fn;
++	pipeline_t pl;
++} mb_bat;
++
++static void mb_batch_keep_state(const mb_opt_t *opt, mb_idx_t *idx, int32_t n, const char **fn, const char *hdr)
++{
++	int32_t i;
++	memset(&mb_bat, 0, sizeof(mb_bat));
++	mb_bat.opt = *opt;
++	mb_bat.idx = idx;
++	mb_bat.hdr = hdr? kom_strdup(hdr) : 0;
++	mb_bat.n_fn = n;
++	mb_bat.fn = kom_calloc(char*, n > 0? n : 1);
++	for (i = 0; i < n; ++i) mb_bat.fn[i] = kom_strdup(fn[i]);
++}
++
++int mb_batch_write_header(const char *fn)
++{
++	FILE *fp;
++	if (mb_bat.idx == 0 || (fp = fopen(fn, "wb")) == 0) return -1;
++	if (mb_bat.hdr) fputs(mb_bat.hdr, fp);
++	fclose(fp);
++	return 0;
++}
++
++int64_t mb_batch_run(int64_t max_reads, const char *fn_out) // returns the number of records mapped; 0 at EOF; <0 on error
++{
++	static char obuf[4<<20];
++	step_t *s;
++	int64_t n;
++	FILE *fp;
++	if (mb_bat.idx == 0 || mb_bat.n_fn < 1) return -1;
++	if (!mb_bat.opened) {
++		memset(&mb_bat.pl, 0, sizeof(pipeline_t));
++		mb_bat.pl.n_fp = mb_bat.n_fn;
++		mb_bat.pl.fp = mb_open_bseqs(mb_bat.n_fn, (const char**)mb_bat.fn);
++		if (mb_bat.pl.fp == 0) return -2;
++		mb_bat.pl.opt = &mb_bat.opt, mb_bat.pl.idx = mb_bat.idx;
++		mb_bat.pl.mb_size = mb_bat.opt.mb_size;
++		mb_bat.opened = 1;
++	}
++	if ((fp = fopen(fn_out, "wb")) == 0) return -3;
++	setvbuf(fp, obuf, _IOFBF, sizeof(obuf));
++	mb_bat.pl.fp_out = fp;
++	mb_bat.pl.max_reads = max_reads;
++	s = (step_t*)worker_pipeline(&mb_bat.pl, 0, 0);
++	if (s == 0) { fclose(fp); return 0; }
++	n = s->n_seq;
++	worker_pipeline(&mb_bat.pl, 1, s);
++	worker_pipeline(&mb_bat.pl, 2, s); // frees s
++	fclose(fp);
++	return n;
++}
++
++void mb_batch_close(void)
++{
++	int32_t i;
++	if (mb_bat.opened) {
++		for (i = 0; i < mb_bat.pl.n_fp; ++i) mb_bseq_close(mb_bat.pl.fp[i]);
++		free(mb_bat.pl.fp);
++	}
++	if (mb_bat.idx) mb_idx_destroy(mb_bat.idx);
++	for (i = 0; i < mb_bat.n_fn; ++i) free(mb_bat.fn[i]);
++	free(mb_bat.fn); free(mb_bat.hdr);
++	memset(&mb_bat, 0, sizeof(mb_bat));
++}
++
++int mb_batch_set_reads(int32_t n, const char **fn) // map other read files with the index already loaded
++{
++	int32_t i;
++	if (mb_bat.idx == 0) return -1;
++	if (mb_bat.opened) {
++		for (i = 0; i < mb_bat.pl.n_fp; ++i) mb_bseq_close(mb_bat.pl.fp[i]);
++		free(mb_bat.pl.fp);
++		mb_bat.opened = 0;
++	}
++	for (i = 0; i < mb_bat.n_fn; ++i) free(mb_bat.fn[i]);
++	free(mb_bat.fn);
++	mb_bat.n_fn = n;
++	mb_bat.fn = kom_calloc(char*, n > 0? n : 1);
++	for (i = 0; i < n; ++i) mb_bat.fn[i] = kom_strdup(fn[i]);
++	return 0;
++}
++#endif
++
+ /********************
+  * Arbitrary header *
+  ********************/
+@@ -569,6 +675,13 @@
+ 	}
+ 	if (hdr_ins.s) free(hdr_ins.s);
+ 
++#ifdef MB_BATCH_API
++	if (mb_batch_keep) { // [batch API] keep the index and options; reads are mapped later by mb_batch_run()
++		mb_batch_keep_state(&mo, idx, argc - (o.ind + 1), (const char**)&argv[o.ind+1], hdr.s);
++		free(hdr.s);
++		return 0;
++	}
++#endif
+ 	mb_map_file(&mo, idx, argc - (o.ind + 1), (const char**)&argv[o.ind+1], hdr.s, fn_out);
+ 	free(hdr.s);
+ 	mb_idx_destroy(idx);
+--- a/bwtgen.c
++++ b/bwtgen.c
+@@ -373,7 +373,7 @@
+ 		+ OCC_INTERVAL / BIT_PER_CHAR * n_iter * 2 * (sizeof(bgint_t) / 4) // buffer at the end of occ array 
+ 		+ incMaxBuildSize/5 * 3 * (sizeof(bgint_t) / 4); // space for the 3 temporary arrays in each iteration
+ 	if (bwtInc->availableWord < MIN_AVAILABLE_WORD) bwtInc->availableWord = MIN_AVAILABLE_WORD; // lh3: otherwise segfaul when availableWord is too small
+-	fprintf(stderr, "[%s] textLength=%ld, availableWord=%ld\n", __func__, (long)textLength, (long)bwtInc->availableWord);
++	fprintf(stderr, "[%s] textLength=%lld, availableWord=%lld\n", __func__, (long long)textLength, (long long)bwtInc->availableWord);
+ 	bwtInc->workingMemory = (unsigned*)calloc(bwtInc->availableWord, BYTES_IN_WORD);
+ 
+ 	return bwtInc;
+@@ -865,6 +865,211 @@
+ }
+ 
+ 
++/************************************************************************************
++ * [par] Multi-threaded parts of an iteration (results are identical to the serial  *
++ * code; only scratch space that bwtgen already reserves is used).                  *
++ ************************************************************************************/
++#include "kthread.h"
++extern int mb_n_threads;
++
++static inline unsigned int bgTextChar(const unsigned int *packedText, bgint_t r) // r-th character of the block
++{
++	return packedText[r / CHAR_PER_WORD] >> ((CHAR_PER_WORD - 1 - r % CHAR_PER_WORD) * BIT_PER_CHAR) & 3;
++}
++
++static inline bgint_t bgLF(const BWT *bwt, bgint_t r, unsigned int c) // the step of BWTIncGetAbsoluteRank()
++{
++	return bwt->cumulativeFreq[c] + BWTOccValue(bwt, r, c) + 1;
++}
++
++typedef struct {
++	const BWT *bwt;
++	const unsigned int *text;
++	bgint_t numChar, maxRank;
++	int n_seg;
++	bgint_t *b;          // segment k is [b[k], b[k+1])
++	bgint_t *rankAtEnd;  // rank of the suffix starting at b[k+1]
++	bgint_t (*cnt)[ALPHABET_SIZE][2], (*off)[ALPHABET_SIZE][2];
++	uint8_t *side;       // 1 bit per character: rank > inverseSa0
++	bgint_t *seq, *absoluteRank;
++} AbsRankPar;
++
++// Exact rank of the suffix starting at e (0 < e < numChar) without walking from the end of the block:
++// walk the same recurrence from the lowest and the highest possible rank over T[e, e+L); once the two
++// meet, the rank no longer depends on the unknown suffix after e+L. Longer L for repeats; at the end of
++// the block the true starting rank (inverseSa0) is known, so this always terminates with the exact value.
++static void absRankCheckpoint(void *data, long k, int tid)
++{
++	AbsRankPar *a = (AbsRankPar*)data;
++	bgint_t e = a->b[k + 1], L = 256, p, lo, hi;
++	(void)tid;
++	for (;;) {
++		bgint_t end = e + L;
++		if (end >= a->numChar) end = a->numChar, lo = hi = a->bwt->inverseSa0;
++		else lo = 0, hi = a->maxRank;
++		for (p = end; p > e;) {
++			unsigned int c = bgTextChar(a->text, --p);
++			if (lo == hi) lo = hi = bgLF(a->bwt, lo, c);
++			else lo = bgLF(a->bwt, lo, c), hi = bgLF(a->bwt, hi, c);
++		}
++		if (lo == hi) { a->rankAtEnd[k] = lo; return; }
++		L <<= 2;
++	}
++}
++
++static void absRankWalk(void *data, long k, int tid) // ranks of the segment's suffixes -> seq[r] (temporary), side bits, counts
++{
++	AbsRankPar *a = (AbsRankPar*)data;
++	bgint_t r, saIndex = a->rankAtEnd[k], inv = a->bwt->inverseSa0;
++	(void)tid;
++	memset(a->cnt[k], 0, sizeof(a->cnt[k]));
++	for (r = a->b[k + 1]; r > a->b[k];) {
++		unsigned int c = bgTextChar(a->text, --r), s;
++		saIndex = bgLF(a->bwt, saIndex, c);
++		a->seq[r] = saIndex;
++		s = saIndex > inv;
++		if (s) a->side[r >> 3] |= 1 << (r & 7);
++		else a->side[r >> 3] &= ~(1 << (r & 7));
++		a->cnt[k][c][s]++;
++	}
++}
++
++// the counting sort of BWTIncGetAbsoluteRank(): same slots, same order (characters are processed from the end)
++static void absRankPlaceRank(void *data, long k, int tid)
++{
++	AbsRankPar *a = (AbsRankPar*)data;
++	bgint_t r, pos[ALPHABET_SIZE][2];
++	(void)tid;
++	memcpy(pos, a->off[k], sizeof(pos));
++	for (r = a->b[k + 1]; r > a->b[k];) {
++		unsigned int c = bgTextChar(a->text, --r), s = a->side[r >> 3] >> (r & 7) & 1;
++		bgint_t d = s? pos[c][1]-- : pos[c][0]++;
++		a->absoluteRank[d] = a->seq[r];
++	}
++}
++
++static void absRankPlaceSeq(void *data, long k, int tid)
++{
++	AbsRankPar *a = (AbsRankPar*)data;
++	bgint_t r, pos[ALPHABET_SIZE][2];
++	(void)tid;
++	memcpy(pos, a->off[k], sizeof(pos));
++	for (r = a->b[k + 1]; r > a->b[k];) {
++		unsigned int c = bgTextChar(a->text, --r), s = a->side[r >> 3] >> (r & 7) & 1;
++		bgint_t d = s? pos[c][1]-- : pos[c][0]++;
++		a->seq[d] = r;
++	}
++}
++
++// Same output as BWTIncGetAbsoluteRank(). scratch: >= numChar/8 bytes not overlapping anything in use
++static bgint_t BWTIncGetAbsoluteRankPar(BWT *bwt, bgint_t* __restrict absoluteRank, bgint_t* __restrict seq,
++										const unsigned int *packedText, const bgint_t numChar,
++										const bgint_t* cumulativeCount, const unsigned int firstCharInLastIteration,
++										uint8_t *scratch, int n_threads)
++{
++	AbsRankPar a;
++	bgint_t start[ALPHABET_SIZE], end[ALPHABET_SIZE], seg_len, idx;
++	int k, c, n_seg;
++
++	assert(numChar % CHAR_PER_WORD == 0);
++	n_seg = n_threads * 8;
++	seg_len = (numChar / n_seg + 63) / 64 * 64;
++	if (seg_len < 65536) seg_len = 65536;
++	n_seg = (numChar + seg_len - 1) / seg_len;
++
++	memset(&a, 0, sizeof(a));
++	a.bwt = bwt, a.text = packedText, a.numChar = numChar, a.n_seg = n_seg;
++	a.maxRank = bwt->textLength + 1;
++	a.side = scratch, a.seq = seq, a.absoluteRank = absoluteRank;
++	a.b = (bgint_t*)calloc(n_seg + 1, sizeof(bgint_t));
++	a.rankAtEnd = (bgint_t*)calloc(n_seg, sizeof(bgint_t));
++	a.cnt = calloc(n_seg, sizeof(*a.cnt));
++	a.off = calloc(n_seg, sizeof(*a.off));
++	for (k = 0; k < n_seg; ++k) a.b[k] = (bgint_t)k * seg_len;
++	a.b[n_seg] = numChar;
++	a.rankAtEnd[n_seg - 1] = bwt->inverseSa0;
++
++	if (n_seg > 1) kt_for(n_threads, absRankCheckpoint, &a, n_seg - 1);
++	kt_for(n_threads, absRankWalk, &a, n_seg);
++
++	for (c = 0; c < ALPHABET_SIZE; ++c)
++		start[c] = cumulativeCount[c], end[c] = cumulativeCount[c+1] - 1;
++	for (k = n_seg - 1; k >= 0; --k) { // segments with larger positions are processed first by the serial code
++		for (c = 0; c < ALPHABET_SIZE; ++c) {
++			a.off[k][c][0] = start[c], start[c] += a.cnt[k][c][0];
++			a.off[k][c][1] = end[c],   end[c]   -= a.cnt[k][c][1];
++		}
++	}
++	kt_for(n_threads, absRankPlaceRank, &a, n_seg); // reads seq[] (temporary ranks), writes absoluteRank[]
++	kt_for(n_threads, absRankPlaceSeq, &a, n_seg);  // overwrites seq[]
++
++	idx = start[firstCharInLastIteration];
++	absoluteRank[idx] = bwt->inverseSa0; // representing the substring of all preceding characters
++	seq[idx] = numChar;
++	free(a.b); free(a.rankAtEnd); free(a.cnt); free(a.off);
++	return idx;
++}
++
++/* Parallel BWTIncSortKey(): split the ranges into independent key intervals by 3-way partitioning
++ * (keys equal to the pivot are final), then sort the pieces with BWTIncSortKey() in parallel. Ties may
++ * end up in a different order than with the serial sort, which BWTIncBuildRelativeRank() and the suffix
++ * sort do not depend on: the keys come out identical and the BWT is unique. */
++typedef struct { bgint_t *key, *seq, n; } SortRange;
++typedef struct { SortRange *r; int n, m; } SortRanges;
++
++static void sortRangePush(SortRanges *s, bgint_t *key, bgint_t *seq, bgint_t n)
++{
++	if (n < 2) return;
++	if (s->n == s->m) {
++		s->m = s->m? s->m * 2 : 64;
++		s->r = (SortRange*)realloc(s->r, s->m * sizeof(SortRange));
++	}
++	s->r[s->n].key = key, s->r[s->n].seq = seq, s->r[s->n++].n = n;
++}
++
++static void sortRangeWorker(void *data, long i, int tid)
++{
++	SortRange *r = &((SortRanges*)data)->r[i];
++	(void)tid;
++	BWTIncSortKey(r->key, r->seq, r->n);
++}
++
++static void BWTIncSortKeyPar(SortRanges *s, int n_threads)
++{
++	bgint_t tot = 0, target;
++	int i, j, changed = 1;
++	for (i = 0; i < s->n; ++i) tot += s->r[i].n;
++	target = tot / (n_threads * 8) + 1;
++	while (changed) { // split ranges larger than target
++		changed = 0;
++		for (i = 0; i < s->n; ++i) {
++			SortRange r = s->r[i];
++			bgint_t lt, gt, p, pivot, t;
++			if (r.n <= target || r.n < 4096) continue;
++			pivot = med3(r.key[0], r.key[r.n / 2], r.key[r.n - 1]);
++			for (lt = 0, gt = r.n, p = 0; p < gt;) { // Dijkstra 3-way partition
++				if (r.key[p] < pivot) {
++					t = r.key[p], r.key[p] = r.key[lt], r.key[lt] = t;
++					t = r.seq[p], r.seq[p] = r.seq[lt], r.seq[lt] = t;
++					++lt, ++p;
++				} else if (r.key[p] > pivot) {
++					--gt;
++					t = r.key[p], r.key[p] = r.key[gt], r.key[gt] = t;
++					t = r.seq[p], r.seq[p] = r.seq[gt], r.seq[gt] = t;
++				} else ++p;
++			}
++			s->r[i] = s->r[--s->n]; // remove this range, add the two sides
++			sortRangePush(s, r.key, r.seq, lt);
++			sortRangePush(s, r.key + gt, r.seq + gt, r.n - gt);
++			changed = 1;
++			break;
++		}
++	}
++	for (i = 1; i < s->n; ++i) // largest first for better load balance
++		for (j = i; j > 0 && s->r[j-1].n < s->r[j].n; --j) { SortRange t = s->r[j]; s->r[j] = s->r[j-1]; s->r[j-1] = t; }
++	kt_for(n_threads, sortRangeWorker, s, s->n);
++}
++
+ static void BWTIncBuildRelativeRank(bgint_t* __restrict sortedRank, bgint_t* __restrict seq,
+ 									bgint_t* __restrict relativeRank, const bgint_t numItem,
+ 									bgint_t oldInverseSa0, const bgint_t *cumulativeCount)
+@@ -1355,23 +1560,36 @@
+ 		// Get rank of new suffix among processed suffix
+ 		// The seq array is built into ALPHABET_SIZE + 2 groups; ALPHABET_SIZE groups + 1 group divided into 2 by inverseSa0 + inverseSa0 as 1 group
+ 		// ->packedText is not used any more and will be overwritten by relativeRank
++		if (mb_n_threads > 1) { // [par] scratch for 1 bit/char: the part of relativeRank[] after packedText
++			uint8_t *scratch = (uint8_t*)(bwtInc->packedText + numChar / CHAR_PER_WORD + 16);
++			assert(scratch + numChar / 8 + 1 <= (uint8_t*)(relativeRank + bwtInc->buildSize + 1));
++			oldInverseSa0RelativeRank = BWTIncGetAbsoluteRankPar(bwtInc->bwt, sortedRank, seq, bwtInc->packedText,
++																 numChar, bwtInc->cumulativeCountInCurrentBuild, bwtInc->firstCharInLastIteration,
++																 scratch, mb_n_threads);
++		} else
+ 		oldInverseSa0RelativeRank = BWTIncGetAbsoluteRank(bwtInc->bwt, sortedRank, seq, bwtInc->packedText, 
+ 														  numChar, bwtInc->cumulativeCountInCurrentBuild, bwtInc->firstCharInLastIteration);
+ 
++		// [par] the same ranges, sorted one after another (serial) or split and sorted in parallel
++		SortRanges ranges = {0, 0, 0};
++#define SORT_RANGE(k, q, n) do { if (mb_n_threads > 1) sortRangePush(&ranges, k, q, n); else BWTIncSortKey(k, q, n); } while (0)
+ 		// Sort rank by ALPHABET_SIZE + 2 groups (or ALPHABET_SIZE + 1 groups when inverseSa0 sit on the border of a group)
+ 		for (i=0; i<ALPHABET_SIZE; i++) {
+ 			if (bwtInc->cumulativeCountInCurrentBuild[i] > oldInverseSa0RelativeRank ||
+ 				bwtInc->cumulativeCountInCurrentBuild[i+1] <= oldInverseSa0RelativeRank) {
+-				BWTIncSortKey(sortedRank + bwtInc->cumulativeCountInCurrentBuild[i], seq + bwtInc->cumulativeCountInCurrentBuild[i], bwtInc->cumulativeCountInCurrentBuild[i+1] - bwtInc->cumulativeCountInCurrentBuild[i]);
++				SORT_RANGE(sortedRank + bwtInc->cumulativeCountInCurrentBuild[i], seq + bwtInc->cumulativeCountInCurrentBuild[i], bwtInc->cumulativeCountInCurrentBuild[i+1] - bwtInc->cumulativeCountInCurrentBuild[i]);
+ 			} else {
+ 				if (bwtInc->cumulativeCountInCurrentBuild[i] < oldInverseSa0RelativeRank) {
+-					BWTIncSortKey(sortedRank + bwtInc->cumulativeCountInCurrentBuild[i], seq + bwtInc->cumulativeCountInCurrentBuild[i], oldInverseSa0RelativeRank - bwtInc->cumulativeCountInCurrentBuild[i]);
++					SORT_RANGE(sortedRank + bwtInc->cumulativeCountInCurrentBuild[i], seq + bwtInc->cumulativeCountInCurrentBuild[i], oldInverseSa0RelativeRank - bwtInc->cumulativeCountInCurrentBuild[i]);
+ 				}
+ 				if (bwtInc->cumulativeCountInCurrentBuild[i+1] > oldInverseSa0RelativeRank + 1) {
+-					BWTIncSortKey(sortedRank + oldInverseSa0RelativeRank + 1, seq + oldInverseSa0RelativeRank + 1, bwtInc->cumulativeCountInCurrentBuild[i+1] - oldInverseSa0RelativeRank - 1);
++					SORT_RANGE(sortedRank + oldInverseSa0RelativeRank + 1, seq + oldInverseSa0RelativeRank + 1, bwtInc->cumulativeCountInCurrentBuild[i+1] - oldInverseSa0RelativeRank - 1);
+ 				}
+ 			}
+ 		}
++#undef SORT_RANGE
++		if (mb_n_threads > 1) BWTIncSortKeyPar(&ranges, mb_n_threads);
++		free(ranges.r);
+ 
+ 		// build relative rank; sortedRank is updated for merging to cater for the fact that $ is not encoded in bwt
+ 		// the cumulative freq information is used to make sure that inverseSa0 and suffix beginning with different characters are kept in different unsorted groups)
+@@ -1525,8 +1743,8 @@
+ 		BWTIncConstruct(bwtInc, textToLoad);
+ 		processedTextLength += textToLoad;
+ 		if (bwtInc->numberOfIterationDone % 10 == 0) {
+-			fprintf(stderr, "[BWTIncConstructFromPacked] %lu iterations done. %lu characters processed.\n",
+-					(long)bwtInc->numberOfIterationDone, (long)processedTextLength);
++			fprintf(stderr, "[BWTIncConstructFromPacked] %llu iterations done. %llu characters processed.\n",
++					(unsigned long long)bwtInc->numberOfIterationDone, (unsigned long long)processedTextLength);
+ 		}
+ 	}
+ 
+--- a/index.c
++++ b/index.c
+@@ -144,6 +144,7 @@
+ 	fprintf(fp, "Usage: minibwa genraw [options] <in.pac> <out.raw-bwt>\n");
+ 	fprintf(fp, "Options:\n");
+ 	fprintf(fp, "  -b NUM      block size [10m]\n");
++	fprintf(fp, "  -t INT      number of threads [%d]\n", mb_n_threads);
+ 	fprintf(fp, "  --help      print this help message\n");
+ 	return fp == stdout? 0 : 1;
+ }
+@@ -154,8 +155,9 @@
+ #ifdef USE_GPL
+ 	ketopt_t o = KETOPT_INIT;
+ 	int c, block_size = 10000000;
+-	while ((c = ketopt(&o, argc, argv, 1, "b:", long_opts)) >= 0) {
++	while ((c = ketopt(&o, argc, argv, 1, "b:t:", long_opts)) >= 0) {
+ 		if (c == 'b') block_size = kom_parse_num(o.arg, 0);
++		else if (c == 't') mb_n_threads = atoi(o.arg); // [par]
+ 		else if (c == 901) return usage_genraw(stdout);
+ 	}
+ 	if (argc - o.ind < 2) return usage_genraw(stderr);
+@@ -231,6 +233,7 @@
+ 	fprintf(fp, "Options:\n");
+ 	fprintf(fp, "  -u INT    sample rate at 1/(1<<INT) [%d]\n", sa_bit);
+ 	fprintf(fp, "  -r        input BWT in the raw BWA format\n");
++	fprintf(fp, "  -t INT    number of threads [%d]\n", mb_n_threads);
+ 	fprintf(fp, "  --help    print this help message\n");
+ 	return fp == stdout? 0 : 1;
+ }
+@@ -240,8 +243,9 @@
+ 	mb_bwt_t *bwt;
+ 	int c, sa_bit = 4, is_raw = 0;
+ 	ketopt_t o = KETOPT_INIT;
+-	while ((c = ketopt(&o, argc, argv, 1, "ru:", long_opts)) >= 0) {
++	while ((c = ketopt(&o, argc, argv, 1, "ru:t:", long_opts)) >= 0) {
+ 		if (c == 'u') sa_bit = atoi(o.arg);
++		else if (c == 't') mb_n_threads = atoi(o.arg); // [par]
+ 		else if (c == 'r') is_raw = 1;
+ 		else if (c == 901) return usage_gensa(stdout, sa_bit);
+ 	}
+@@ -263,7 +267,7 @@
+ 	fprintf(fp, "  -l        low-memory GPL'd algorithm for BWT construction\n");
+ 	fprintf(fp, "  -b NUM    block size (effective with -l) [10m]\n");
+ #ifdef LIBSAIS_OPENMP
+-	fprintf(fp, "  -t INT    number of threads (effective w/o -l) [%d]\n", n_thread);
++	fprintf(fp, "  -t INT    number of threads [%d]\n", n_thread);
+ #endif
+ 	fprintf(fp, "  --meth    build FM-index for BS-seq mapping\n");
+ 	fprintf(fp, "  --help    print this help message\n");
+@@ -305,6 +309,7 @@
+ 	kom_assert(l2b, "failed to read the genome FASTA.");
+ 	if (low_mem) {
+ #ifdef USE_GPL
++		mb_n_threads = n_thread; // [par] bwtgen and SA sampling are multi-threaded too
+ 		l2b_save_pac(fn_l2b, l2b, 1);
+ 		mb_bwtgen(fn_l2b, fn_bwt, block_size);
+ 		l2b_save(fn_l2b, l2b);
