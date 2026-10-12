@@ -68,7 +68,7 @@ async function run(m) {
 			const tc = performance.now(), fh = await jobs.getFileHandle('index.l2b', { create: true });
 			await m.indexFiles.l2b.stream().pipeTo(await fh.createWritable());
 			handles[m.index + '.l2b'] = await fh.createSyncAccessHandle();
-			postMessage({ type: 'log', text: `[align] ${m.index}.l2b → OPFS 임시 파일 (${(m.indexFiles.l2b.size / 1e9).toFixed(2)} GB, ${((performance.now() - tc) / 1000).toFixed(1)} s; 참조 서열 랜덤 읽기용)\n` });
+			postMessage({ type: 'log', text: `[align] ${m.index}.l2b → OPFS temp file (${(m.indexFiles.l2b.size / 1e9).toFixed(2)} GB, ${((performance.now() - tc) / 1000).toFixed(1)} s; for random access to the reference)\n` });
 		}
 		if (mt) {
 			M = await self.createMinibwa({ mbwIO: wasi, mbwThreads: m.threads, mainScriptUrlOrBlob: m.wasmUrl });

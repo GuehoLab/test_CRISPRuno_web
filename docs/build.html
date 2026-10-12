@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ko">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -11,55 +11,55 @@
 <body>
 <main>
 	<h1>CRISPRuno Web · reference index (minibwa)</h1>
-	<nav class="tabs"><a href="index.html">처음</a><a href="build.html" class="on">1. 인덱스 만들기</a><a href="crispruno.html">2. CRISPRuno</a></nav>
-	<p class="sub">FASTA로 reference index(<span class="mono">.l2b</span> + <span class="mono">.mbw</span>)를 만들고 내려받습니다. 한 번 만들어 저장해 두면, CRISPRuno 페이지에서 그 파일을 바로 열어 쓸 수 있어 다시 만들 필요가 없습니다.</p>
+	<nav class="tabs"><a href="index.html">Home</a><a href="build.html" class="on">1. Build index</a><a href="crispruno.html">2. CRISPRuno</a></nav>
+	<p class="sub">Builds a reference index (<span class="mono">.l2b</span> + <span class="mono">.mbw</span>) from a FASTA file and lets you download it. Once saved, the files can be opened directly on the CRISPRuno page, so the index never has to be rebuilt.</p>
 
 	<section>
-		<h2>환경</h2>
+		<h2>Environment</h2>
 		<table id="env"><tbody></tbody></table>
 		<div class="grid" style="margin-top:10px">
-			<label for="engine">엔진</label>
-			<select id="engine"><option value="auto">자동 (지원되면 wasm64)</option><option value="wasm64">wasm64 (Memory64, ≤16 GiB)</option><option value="wasm32">wasm32 (≤4 GiB)</option></select>
+			<label for="engine">Engine</label>
+			<select id="engine"><option value="auto">Auto (wasm64 if supported)</option><option value="wasm64">wasm64 (Memory64, ≤16 GiB)</option><option value="wasm32">wasm32 (≤4 GiB)</option></select>
 		</div>
-		<div class="row"><button id="btn-persist">저장소 persist 요청</button><span id="persist-msg" class="note"></span></div>
+		<div class="row"><button id="btn-persist">Request persistent storage</button><span id="persist-msg" class="note"></span></div>
 	</section>
 
 	<section>
-		<h2>WASM 메모리</h2>
+		<h2>WASM memory</h2>
 		<div class="gauge" id="gauge"><div></div><span style="left:0%"></span></div>
-		<p class="note" id="gauge-txt">실행 중인 worker 없음</p>
+		<p class="note" id="gauge-txt">No worker running</p>
 	</section>
 
 	<section>
-		<h2>인덱스 만들기</h2>
+		<h2>Build index</h2>
 		<div class="grid">
 			<label for="fa">FASTA (.fa / .fna / .gz)</label><input type="file" id="fa" accept=".fa,.fasta,.fna,.gz">
-			<label for="idx-name">인덱스 이름</label><input type="text" id="idx-name" placeholder="예: chm13v2">
-			<label for="method">방식</label>
-			<select id="method"><option value="auto">자동 (크기로 결정)</option><option value="staged">단계식 저메모리 (큰 게놈)</option><option value="inmem">메모리 내 libsais (≈300 Mb 이하)</option></select>
-			<label for="threads">스레드</label><div><input type="number" id="threads" value="1" min="1" max="64" style="max-width:120px"> <span class="note" id="threads-note"></span></div>
-			<label for="sa-bit">SA 샘플링 (-u)</label>
-			<select id="sa-bit"><option value="4">1/16 (정렬이 가장 빠름; 인간 게놈은 wasm64 필요)</option><option value="5">1/32</option><option value="6">1/64</option><option value="7">1/128 (wasm32로 인간 게놈을 정렬하려면 필수)</option></select>
+			<label for="idx-name">Index name</label><input type="text" id="idx-name" placeholder="e.g. chm13v2">
+			<label for="method">Method</label>
+			<select id="method"><option value="auto">Auto (by genome size)</option><option value="staged">Staged, low memory (large genomes)</option><option value="inmem">In-memory libsais (up to ≈300 Mb)</option></select>
+			<label for="threads">Threads</label><div><input type="number" id="threads" value="1" min="1" max="64" style="max-width:120px"> <span class="note" id="threads-note"></span></div>
+			<label for="sa-bit">SA sampling (-u)</label>
+			<select id="sa-bit"><option value="4">1/16 (fastest alignment; human genome needs wasm64)</option><option value="5">1/32</option><option value="6">1/64</option><option value="7">1/128 (required to align to a human genome with wasm32)</option></select>
 		</div>
 		<p class="note" id="sa-note"></p>
-		<div class="row"><button class="primary" id="btn-build">인덱스 만들기</button><span id="build-msg" class="note"></span></div>
+		<div class="row"><button class="primary" id="btn-build">Build index</button><span id="build-msg" class="note"></span></div>
 		<table id="stages" style="margin-top:10px"><tbody></tbody></table>
-		<p class="note">T2T(3.1 Gb) 기준 단일 스레드 약 1.5시간, 2스레드 약 1시간(코어가 많을수록 더 짧음)이 걸리고 그동안 탭을 열어 두어야 합니다. 만든 인덱스는 이 브라우저 저장소(OPFS)에 남고, 아래에서 내려받을 수 있습니다.</p>
+		<p class="note">For T2T (3.1 Gb) this takes about 1.5 h with one thread and about 1 h with two (less with more cores); keep the tab open meanwhile. The index stays in this browser's storage (OPFS) and can be downloaded below.</p>
 	</section>
 
 	<section>
-		<h2>저장된 인덱스 (이 브라우저의 OPFS)</h2>
-		<table id="idx-table"><thead><tr><th>인덱스</th><th class="num">게놈 길이</th><th class="num">SA</th><th class="num">파일 크기</th><th class="num">정렬 시 예상 메모리</th><th>만든 정보</th><th></th></tr></thead><tbody></tbody></table>
+		<h2>Saved indexes (OPFS of this browser)</h2>
+		<table id="idx-table"><thead><tr><th>Index</th><th class="num">Genome length</th><th class="num">SA</th><th class="num">File size</th><th class="num">Est. memory for alignment</th><th>Build info</th><th></th></tr></thead><tbody></tbody></table>
 		<div id="save-box" class="card hidden">
 			<div id="save-msg" class="note"></div>
 			<progress id="save-prog" value="0" max="1"></progress>
 		</div>
-		<p class="note"><b>폴더에 저장</b>은 고른 폴더에 <span class="mono">이름.l2b</span>, <span class="mono">이름.mbw</span>, <span class="mono">이름.build.json</span>을 한 번에 씁니다(Chrome/Edge). 지원하지 않는 브라우저에서는 파일별로 내려받으세요.
-			내려받은 뒤 OPFS에서 지워도, CRISPRuno 페이지에서 그 파일을 열면 그대로 쓸 수 있습니다. 같은 인덱스는 CLI(<span class="mono">minibwa map</span>)에서도 쓸 수 있습니다.</p>
+		<p class="note"><b>Save to folder</b> writes <span class="mono">name.l2b</span>, <span class="mono">name.mbw</span> and <span class="mono">name.build.json</span> into the chosen folder in one go (Chrome/Edge). In other browsers, download the files one by one.
+			After downloading you can delete the index from OPFS and still use it by opening the files on the CRISPRuno page. The same index also works with the CLI (<span class="mono">minibwa map</span>).</p>
 	</section>
 
 	<section>
-		<h2>로그</h2>
+		<h2>Log</h2>
 		<pre id="log"></pre>
 	</section>
 </main>

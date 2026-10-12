@@ -66,8 +66,8 @@ function gauge(cur, peak, label) {
 	const g = $('gauge'), E = engine();
 	g.firstElementChild.style.width = Math.min(100, (cur / E.limit) * 100) + '%';
 	g.lastElementChild.style.left = Math.min(100, (peak / E.limit) * 100) + '%';
-	$('gauge-txt').textContent = label === null ? `실행 중인 worker 없음${peak ? ' (메모리 반환됨)' : ''} · 한도 ${E.limitText}`
-		: `${label} · 현재 ${fmtBytes(cur)} · 최대 ${fmtBytes(peak)} · 한도 ${E.limitText}`;
+	$('gauge-txt').textContent = label === null ? `No worker running${peak ? ' (memory released)' : ''} · limit ${E.limitText}`
+		: `${label} · current ${fmtBytes(cur)} · peak ${fmtBytes(peak)} · limit ${E.limitText}`;
 }
 
 /******** OPFS ********/
@@ -137,10 +137,10 @@ async function removeIndex(name) {
 async function checkEnv() {
 	const rows = [];
 	const simd = WebAssembly.validate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11]));
-	rows.push(['WebAssembly SIMD128', simd ? '지원' : '미지원 (실행 불가)', simd ? 'ok' : 'err']);
-	rows.push(['WebAssembly Memory64 (wasm64)', MEM64 ? '지원 — 4 GiB 한도 없음 (최대 16 GiB)' : '미지원 — wasm32 (4 GiB)로 실행', MEM64 ? 'ok' : 'warn']);
-	rows.push(['멀티스레드 (SharedArrayBuffer)', MT_OK ? `가능 — CPU 코어 ${CORES}개` : !MEM64 ? '미지원 (wasm64 필요) — 단일 스레드로 실행'
-		: '불가 — 페이지가 cross-origin isolated가 아님 (COOP/COEP 헤더 필요). 단일 스레드로 실행', MT_OK ? 'ok' : 'warn']);
+	rows.push(['WebAssembly SIMD128', simd ? 'supported' : 'not supported (cannot run)', simd ? 'ok' : 'err']);
+	rows.push(['WebAssembly Memory64 (wasm64)', MEM64 ? 'supported — no 4 GiB limit (up to 16 GiB)' : 'not supported — running with wasm32 (4 GiB)', MEM64 ? 'ok' : 'warn']);
+	rows.push(['Multi-threading (SharedArrayBuffer)', MT_OK ? `available — ${CORES} CPU cores` : !MEM64 ? 'not supported (needs wasm64) — running single-threaded'
+		: 'unavailable — the page is not cross-origin isolated (COOP/COEP headers needed). Running single-threaded', MT_OK ? 'ok' : 'warn']);
 	const sah = await new Promise((res) => {
 		try {
 			const w = new Worker(URL.createObjectURL(new Blob(["postMessage(typeof FileSystemFileHandle !== 'undefined' && 'createSyncAccessHandle' in FileSystemFileHandle.prototype)"], { type: 'text/javascript' })));
@@ -148,18 +148,18 @@ async function checkEnv() {
 			w.onerror = () => { res(false); w.terminate(); };
 		} catch (_) { res(false); }
 	});
-	rows.push(['OPFS + SyncAccessHandle (Worker)', sah ? '지원' : '미지원 (실행 불가)', sah ? 'ok' : 'err']);
-	if (navigator.deviceMemory) rows.push(['기기 메모리', `≥ ${navigator.deviceMemory} GB (최대 8로 표시됨) · 인간 게놈은 16 GB 이상 권장`, '']);
+	rows.push(['OPFS + SyncAccessHandle (Worker)', sah ? 'supported' : 'not supported (cannot run)', sah ? 'ok' : 'err']);
+	if (navigator.deviceMemory) rows.push(['Device memory', `≥ ${navigator.deviceMemory} GB (browsers report at most 8) · 16 GB or more recommended for a human genome`, '']);
 	if (navigator.storage && navigator.storage.estimate) {
 		const est = await navigator.storage.estimate();
-		rows.push(['저장소 사용량 / 할당량', `${fmtBytes(est.usage)} / ${fmtBytes(est.quota)}`, est.quota - est.usage < 10e9 ? 'warn' : '']);
+		rows.push(['Storage usage / quota', `${fmtBytes(est.usage)} / ${fmtBytes(est.quota)}`, est.quota - est.usage < 10e9 ? 'warn' : '']);
 	}
-	if (navigator.storage && navigator.storage.persisted) rows.push(['persist', (await navigator.storage.persisted()) ? 'persisted' : '아님 (브라우저가 정리할 수 있음)', '']);
+	if (navigator.storage && navigator.storage.persisted) rows.push(['persist', (await navigator.storage.persisted()) ? 'persisted' : 'not persisted (the browser may evict it)', '']);
 	$('env').tBodies[0].innerHTML = rows.map(([k, v, c]) => `<tr><th>${esc(k)}</th><td class="${c}">${esc(v)}</td></tr>`).join('');
 }
 function initPersistButton() {
 	$('btn-persist').addEventListener('click', async () => {
-		$('persist-msg').textContent = (navigator.storage.persist && await navigator.storage.persist()) ? 'persisted' : '브라우저가 거절함';
+		$('persist-msg').textContent = (navigator.storage.persist && await navigator.storage.persist()) ? 'persisted' : 'refused by the browser';
 		checkEnv();
 	});
 }

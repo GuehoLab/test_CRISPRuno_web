@@ -4,13 +4,13 @@
  * OPFS: minibwa/crispruno/<run>/ (all outputs, named <root>.* like CRISPRuno), minibwa/cu-jobs/<run>.<job>/ (alignment chunks, temporary)
  */
 const STEPS = [
-	['prep', 'Prep', 'prep_input — primer/guide 위치 (bowtie2 -c → minibwa), origin 서열, read 수·길이'],
+	['prep', 'Prep', 'prep_input — primer/guide location (bowtie2 -c → minibwa), origin sequence, read count and length'],
 	['umi', 'UMI', 'add_umi_from_umi_file · analyze_UMIs_initial'],
 	['primer', 'Primer/adapter trimming', 'filter_on_primer (SSW · cutadapt -a)'],
 	['align', 'Align (minibwa)', 'align_reads (bowtie2 → minibwa · samtools sort)'],
-	['assign', 'Read 할당', 'make_final_read_assignments · collapse_cut_points'],
-	['crispresso', 'CRISPResso 정량', 'prep_crispresso2 · CRISPResso2 (정량 부분) · run_and_aggregate_crispresso'],
-	['summary', '요약 · 리포트', 'make_final_summary · make_report (SVG 그림)'],
+	['assign', 'Read assignment', 'make_final_read_assignments · collapse_cut_points'],
+	['crispresso', 'CRISPResso quantification', 'prep_crispresso2 · CRISPResso2 (quantification) · run_and_aggregate_crispresso'],
+	['summary', 'Summary · report', 'make_final_summary · make_report (SVG figures)'],
 ];
 let busy = false, curWorker = null, curReject = null, curIsAlign = false, cancelled = false;
 
@@ -30,10 +30,10 @@ function renderSettings() {
 			['guide_sequences', S.guide_sequences.join(', ') || '—'], ['min_primer_length', S.min_primer_length], ['primer_in_r2', S.primer_in_r2]];
 		const changed = CuSettings.DEFAULTS.filter(([k, d]) => !['root', 'fastq_r1', 'fastq_r2', 'fastq_umi', 'primer_seq', 'guide_sequences', 'min_primer_length', 'primer_in_r2', 'genome', 'aligner_genome'].includes(k) && JSON.stringify(S[k]) !== JSON.stringify(k === 'n_processes' ? 1 : d));
 		el.innerHTML = `<table><tbody>${rows.map(([k, v]) => `<tr><th class="mono">${esc(k)}</th><td class="mono">${esc(v)}</td></tr>`).join('')}</tbody></table>` +
-			(changed.length ? `<p class="note">기본값과 다른 설정: ${changed.map(([k]) => `<span class="mono">${esc(k)}=${esc(JSON.stringify(S[k]))}</span>`).join(', ')}</p>` : '') +
+			(changed.length ? `<p class="note">Settings that differ from the defaults: ${changed.map(([k]) => `<span class="mono">${esc(k)}=${esc(JSON.stringify(S[k]))}</span>`).join(', ')}</p>` : '') +
 			warnings.map((w) => `<p class="warn">${esc(w)}</p>`).join('');
 		if (!$('run-name').value.trim()) $('run-name').placeholder = S.root;
-	} catch (e) { el.innerHTML = `<span class="err">settings 오류: ${esc(e.message)}</span>`; }
+	} catch (e) { el.innerHTML = `<span class="err">Settings error: ${esc(e.message)}</span>`; }
 	renderInputs();
 }
 function refFiles() {
@@ -42,21 +42,21 @@ function refFiles() {
 }
 function renderInputs() {
 	const F = fileMap(), R = refFiles();
-	$('input-info').innerHTML = `<b>선택한 파일:</b> ${Object.keys(F).map(esc).join(', ') || '없음'}<br><b>Reference 서열:</b> ${R.fasta ? esc(R.fasta.name) + (R.fai ? ' + .fai' : ' (.fai는 실행 시 생성)') : '인덱스의 .l2b 사용'}`;
+	$('input-info').innerHTML = `<b>Selected files:</b> ${Object.keys(F).map(esc).join(', ') || 'none'}<br><b>Reference sequence:</b> ${R.fasta ? esc(R.fasta.name) + (R.fai ? ' + .fai' : ' (.fai is built when running)') : 'read from the index .l2b'}`;
 }
 async function selectedIndex() {
 	if (document.querySelector('input[name=src]:checked').value === 'file') {
 		const fs = [...$('idx-files').files], l2b = fs.find((f) => f.name.endsWith('.l2b')), mbw = fs.find((f) => f.name.endsWith('.mbw'));
-		if (!l2b || !mbw) throw new Error('인덱스 파일 .l2b와 .mbw를 함께 고르세요.');
+		if (!l2b || !mbw) throw new Error('Select both index files, .l2b and .mbw.');
 		return { name: sanitizeName(l2b.name.replace(/\.l2b$/, '')), source: 'file', files: { l2b, mbw }, info: await readIndexHeaders(mbw, l2b) };
 	}
 	const v = $('opfs-idx').value, x = (await opfsIndexes()).find((i) => i.name === v);
-	if (!x) throw new Error('브라우저 저장소에 인덱스가 없습니다. 인덱스 만들기 페이지에서 만들거나 파일로 고르세요.');
+	if (!x) throw new Error('There is no index in browser storage. Build one on the Build index page or select the index files.');
 	return { name: x.name, source: 'opfs', info: x };
 }
 async function refreshIndexes() {
 	const list = await opfsIndexes(), sel = $('opfs-idx'), prev = sel.value;
-	sel.innerHTML = list.map((i) => `<option value="${esc(i.name)}">${esc(i.name)} (${fmtBytes(i.genome)} bp, SA 1/${2 ** i.saBit})</option>`).join('') || '<option value="">(없음)</option>';
+	sel.innerHTML = list.map((i) => `<option value="${esc(i.name)}">${esc(i.name)} (${fmtBytes(i.genome)} bp, SA 1/${2 ** i.saBit})</option>`).join('') || '<option value="">(none)</option>';
 	if (prev) sel.value = prev;
 }
 
@@ -126,9 +126,9 @@ async function stepPrep(run, S, idx, cfg) {
 async function stepAlign(run, S, idx, cfg) {
 	const dir = await runDirH(run);
 	const st = JSON.parse((await (await fileIn(dir, S.root + '.web_state.json'))?.text()) || '{}');
-	if (!st.aligned_inputs) throw new Error('primer 단계를 먼저 실행하세요 (trimmed FASTQ 없음)');
+	if (!st.aligned_inputs) throw new Error('Run the primer step first (no trimmed FASTQ)');
 	const inputs = {};
-	for (const n of st.aligned_inputs) { const f = await fileIn(dir, n); if (!f) throw new Error(n + ' 없음 — primer 단계를 다시 실행하세요'); inputs[n] = f; }
+	for (const n of st.aligned_inputs) { const f = await fileIn(dir, n); if (!f) throw new Error(n + ' not found — re-run the primer step'); inputs[n] = f; }
 	const job = `${run}.genome`;
 	try { await (await jobsTop()).removeEntry(job, { recursive: true }); } catch (_) {}
 	const args = [...splitOpts($('opts').value), '-b', 'MD'];
@@ -143,11 +143,11 @@ async function stepAlign(run, S, idx, cfg) {
 async function runSteps() {
 	if (busy) return;
 	let S, warnings;
-	try { ({ settings: S, warnings } = parsed()); } catch (e) { $('run-msg').textContent = 'settings 오류: ' + e.message; return; }
+	try { ({ settings: S, warnings } = parsed()); } catch (e) { $('run-msg').textContent = 'Settings error: ' + e.message; return; }
 	const run = runName() || sanitizeName(S.root);
 	S.root = run;
 	const want = STEPS.map(([k]) => k).filter((k) => $('chk-' + k).checked);
-	if (!want.length) { $('run-msg').textContent = '실행할 단계를 고르세요.'; return; }
+	if (!want.length) { $('run-msg').textContent = 'Select the steps to run.'; return; }
 	let idx = null;
 	if (want.includes('prep') || want.includes('align') || !refFiles().fasta) { try { idx = await selectedIndex(); } catch (e) { if (want.includes('prep') || want.includes('align')) { $('run-msg').textContent = e.message; return; } } }
 	busy = true; cancelled = false; $('btn-run').disabled = true; $('btn-cancel').disabled = false; $('prog').classList.remove('hidden');
@@ -161,23 +161,23 @@ async function runSteps() {
 	const T0 = performance.now();
 	log(`=== run ${run}: ${want.join(' → ')} ===`, 'ok');
 	for (const w of warnings) log('[settings] ' + w, 'warn');
-	for (const k of want) setStatus(k, '대기');
+	for (const k of want) setStatus(k, 'queued');
 	let cur = null;
 	try {
 		for (const k of want) {
 			if (cancelled) throw new Error('cancelled');
-			cur = k; setStatus(k, '실행 중…'); $('prog').value = 0;
+			cur = k; setStatus(k, 'running…'); $('prog').value = 0;
 			const t0 = performance.now();
 			if (k === 'prep') await stepPrep(run, S, idx, cfg);
 			else if (k === 'align') await stepAlign(run, S, idx, cfg);
 			else await runWorker(k, run, cfg);
-			setStatus(k, `<span class="ok">완료 ${fmtSec((performance.now() - t0) / 1000)}</span>`);
+			setStatus(k, `<span class="ok">done ${fmtSec((performance.now() - t0) / 1000)}</span>`);
 		}
-		$('run-msg').textContent = `완료: ${fmtSec((performance.now() - T0) / 1000)}`;
+		$('run-msg').textContent = `Done: ${fmtSec((performance.now() - T0) / 1000)}`;
 		$('prog').value = 1;
 	} catch (e) {
-		if (cur) setStatus(cur, `<span class="err">${e.message.includes('cancelled') ? '취소됨' : '실패'}</span>`);
-		$('run-msg').textContent = e.message.includes('cancelled') ? '취소됨' : '실패 — 로그 확인';
+		if (cur) setStatus(cur, `<span class="err">${e.message.includes('cancelled') ? 'cancelled' : 'failed'}</span>`);
+		$('run-msg').textContent = e.message.includes('cancelled') ? 'Cancelled' : 'Failed — see the log';
 		log('[run] ' + e.message, 'err');
 	} finally {
 		busy = false; $('btn-run').disabled = false; $('btn-cancel').disabled = true;
@@ -190,7 +190,7 @@ $('btn-cancel').addEventListener('click', () => {
 	cancelled = true;
 	if (curWorker && curIsAlign) curWorker.postMessage({ type: 'cancel' });
 	else if (curWorker) { curWorker.terminate(); curWorker = null; if (curReject) curReject(new Error('cancelled')); }
-	$('run-msg').textContent = '취소 중…';
+	$('run-msg').textContent = 'Cancelling…';
 });
 
 /******** results ********/
@@ -205,7 +205,7 @@ async function walk(dir, prefix = '') {
 async function refreshRuns(select) {
 	const runs = (await listDir(await cuTop())).filter((e) => e.kind === 'directory').map((e) => e.name);
 	const sel = $('run-sel'), prev = select || sel.value;
-	sel.innerHTML = runs.map((r) => `<option>${esc(r)}</option>`).join('') || '<option value="">(없음)</option>';
+	sel.innerHTML = runs.map((r) => `<option>${esc(r)}</option>`).join('') || '<option value="">(none)</option>';
 	if (prev && runs.includes(prev)) sel.value = prev;
 	await renderResults();
 }
@@ -215,7 +215,7 @@ async function renderResults() {
 	$('files').tBodies[0].innerHTML = ''; $('summary-box').textContent = ''; $('report-frame').classList.add('hidden');
 	if (!run) return;
 	const files = await walk(await runDirH(run));
-	$('files').tBodies[0].innerHTML = files.map((f, i) => `<tr><td class="mono">${esc(f.path)}</td><td class="num">${fmtBytes(f.size)}</td><td class="num"><button data-i="${i}">다운로드</button></td></tr>`).join('');
+	$('files').tBodies[0].innerHTML = files.map((f, i) => `<tr><td class="mono">${esc(f.path)}</td><td class="num">${fmtBytes(f.size)}</td><td class="num"><button data-i="${i}">Download</button></td></tr>`).join('');
 	$('files').onclick = (e) => { const i = e.target.dataset.i; if (i !== undefined) download(files[+i].h, files[+i].path.split('/').pop()); };
 	const sum = files.find((f) => f.path.endsWith('.summary.txt') && !f.path.includes('CRISPResso'));
 	if (sum) { const t = await (await sum.h.getFile()).text(); $('summary-box').textContent = t.split('\n').slice(2).join('\n').trim(); }
@@ -238,7 +238,7 @@ $('btn-zip').addEventListener('click', async () => {
 });
 $('btn-del-run').addEventListener('click', async () => {
 	const run = $('run-sel').value;
-	if (!run || busy || !confirm(`run "${run}"의 모든 파일을 지울까요?`)) return;
+	if (!run || busy || !confirm(`Delete all files of run "${run}"?`)) return;
 	await (await cuTop()).removeEntry(run, { recursive: true });
 	await refreshRuns(); checkEnv();
 });
@@ -259,7 +259,7 @@ $('btn-del-run').addEventListener('click', async () => {
 	}));
 	$('btn-run').addEventListener('click', runSteps);
 	$('threads').value = String(Math.min(CORES, 16));
-	const onThreads = () => { $('threads-note').textContent = !(MT_OK && engine().m64) ? '멀티스레드 불가 — 단일 스레드로 정렬' : `CPU ${CORES}개 중 ${alignWasm().threads}개 사용`; };
+	const onThreads = () => { $('threads-note').textContent = !(MT_OK && engine().m64) ? 'Multi-threading unavailable — aligning with a single thread' : `using ${alignWasm().threads} of ${CORES} CPU cores`; };
 	$('threads').addEventListener('change', onThreads);
 	initEngine(() => { $('threads').disabled = !(MT_OK && engine().m64); onThreads(); });
 	try { const jt = await jobsTop(); for await (const [n] of jt.entries()) await jt.removeEntry(n, { recursive: true }); } catch (_) {}

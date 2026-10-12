@@ -157,7 +157,7 @@ async function prepCrispresso({ reader, readIds, cutCounts, cls, cutAnnotations,
 		if (!printed.has(cut)) printed.set(cut, []);
 		printed.get(cut).push([fixSpaceIds ? rid : id.slice(1), seq.toUpperCase(), id, p1, qual]);
 	}
-	if (spaceIds && !fixSpaceIds) log(`[crispresso] ${spaceIds.toLocaleString()} read names contain a space: CRISPRuno 0.1.22 replaces spaces with '_' in the aligned read names but not when it looks the reads up for CRISPResso, so these reads are not analyzed (same here; the web option "read ID 공백 보정" changes this)`, 'warn');
+	if (spaceIds && !fixSpaceIds) log(`[crispresso] ${spaceIds.toLocaleString()} read names contain a space: CRISPRuno 0.1.22 replaces spaces with '_' in the aligned read names but not when it looks the reads up for CRISPResso, so these reads are not analyzed (same here; the web option "Fix read IDs with spaces" changes this)`, 'warn');
 	const half = avReadLength / 1.5;
 	const infos = [];
 	for (const [cut, rs] of printed) {
