@@ -12,6 +12,7 @@ const STEPS = [
 	['crispresso', 'CRISPResso quantification', 'prep_crispresso2 · CRISPResso2 (quantification) · run_and_aggregate_crispresso'],
 	['summary', 'Summary · report', 'make_final_summary · make_report (SVG figures)'],
 ];
+let OPT = null; // option form (cu/options.js)
 let busy = false, curWorker = null, curReject = null, curIsAlign = false, cancelled = false;
 
 /******** settings & inputs ********/
@@ -33,6 +34,7 @@ function renderSettings() {
 			(changed.length ? `<p class="note">Settings that differ from the defaults: ${changed.map(([k]) => `<span class="mono">${esc(k)}=${esc(JSON.stringify(S[k]))}</span>`).join(', ')}</p>` : '') +
 			warnings.map((w) => `<p class="warn">${esc(w)}</p>`).join('');
 		if (!$('run-name').value.trim()) $('run-name').placeholder = S.root;
+		if (OPT) OPT.sync(S, Object.keys(fileMap()));
 	} catch (e) { el.innerHTML = `<span class="err">Settings error: ${esc(e.message)}</span>`; }
 	renderInputs();
 }
@@ -249,6 +251,7 @@ $('btn-del-run').addEventListener('click', async () => {
 	$('steps').tBodies[0].innerHTML = STEPS.map(([k, name, orig]) => `<tr><td><input type="checkbox" id="chk-${k}" checked></td><td>${esc(name)}</td><td class="note mono" style="margin:0">${esc(orig)}</td><td id="st-${k}"></td></tr>`).join('');
 	let t = null; try { t = localStorage.getItem('cu-settings'); } catch (_) {}
 	$('settings').value = t || CuSettings.TEMPLATE;
+	OPT = CuOptions.build($('options'), { getText: () => $('settings').value, setText: (t) => { $('settings').value = t; renderSettings(); }, defaults: CuSettings.DEFAULTS });
 	$('settings').addEventListener('input', renderSettings);
 	$('run-name').addEventListener('input', renderSettings);
 	$('settings-file').addEventListener('change', async () => { const f = $('settings-file').files[0]; if (f) { $('settings').value = await f.text(); if (!$('run-name').value) $('run-name').value = f.name.replace(/\.[^.]*$/, '') + '.CRISPRuno'; renderSettings(); } });

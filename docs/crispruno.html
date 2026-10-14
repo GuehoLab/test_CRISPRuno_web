@@ -13,6 +13,18 @@
 	.files td button { padding: 3px 9px; }
 	#report-frame { width: 100%; height: 900px; border: 1px solid var(--line); border-radius: 8px; background: #fff; margin-top: 10px; }
 	#summary-box { white-space: pre-wrap; font: 12px/1.45 var(--mono); }
+	.optgrp { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin-top: 8px; }
+	.optgrp > summary { font-weight: 500; color: var(--fg); }
+	.optgrp .badge { margin-left: 6px; color: var(--accent); border-color: var(--accent); }
+	.optgrid { display: grid; grid-template-columns: 250px 1fr; gap: 10px 14px; align-items: start; margin-top: 10px; }
+	.optgrid > label { padding-top: 7px; color: var(--muted); overflow-wrap: anywhere; }
+	.optgrid > label.changed { color: var(--accent); font-weight: 600; }
+	.optin input[type=number] { max-width: 140px; }
+	.optin input[type=checkbox] { margin-top: 9px; }
+	.optin .note { margin-top: 3px; font-size: 12px; }
+	.optin .def { white-space: nowrap; }
+	.optin button.reset { padding: 2px 8px; margin-left: 4px; }
+	@media (max-width: 640px) { .optgrid { grid-template-columns: 1fr; } .optgrid > label { padding-top: 0; } }
 </style>
 </head>
 <body>
@@ -43,6 +55,10 @@
 		</div>
 		<p class="note">Uses the CRISPRuno settings file format as is (one <span class="mono">key&lt;TAB&gt;value</span> per line, <span class="mono">#</span> for comments). Command-line options can be written as lines in the same format (e.g. <span class="mono">keep_intermediate	True</span>).
 			Only file names are used from paths — <span class="mono">fastq_r1/fastq_r2/fastq_umi/cut_region_annotation_file</span> are looked up among the files selected below. <span class="mono">genome/aligner_genome</span> are ignored; the index and FASTA selected below are used instead.</p>
+		<h3 style="margin:16px 0 4px;font-size:15px">Analysis options</h3>
+		<p class="note" style="margin-top:0">CRISPRuno parameters. Changing a value here writes it into the settings text below (and a value set back to its default removes the line); editing the text updates these fields.</p>
+		<div id="options"></div>
+		<h3 style="margin:16px 0 4px;font-size:15px">Settings text</h3>
 		<textarea id="settings" spellcheck="false"></textarea>
 		<div id="settings-info" class="card"></div>
 		<details style="margin-top:10px"><summary>Web-only options</summary>
@@ -98,6 +114,7 @@
 <script src="lib/pyfmt.js"></script>
 <script src="cu/core.js"></script>
 <script src="cu/settings.js"></script>
+<script src="cu/options.js"></script>
 <script src="crispruno.js"></script>
 </body>
 </html>
