@@ -10,7 +10,7 @@
 const C = root.CuCore || require('./core.js');
 const A = root.CuAlign || require('./cralign.js');
 const U = root.CuUmi || require('./umi.js');
-const { str, F, DefaultInt, revcomp, faidx, PlotObject, pyJson } = C;
+const { str, F, DefaultInt, revcomp, faidx, PlotObject, pyJson, own } = C;
 const pyCmp = U.pyStrCmp;
 
 function leftRightMatchesMDZ(md) {
@@ -138,10 +138,11 @@ async function makeFinalReadAssignments(ctx) {
 		notChr = 'Not supported by R2 - different chrs', notAln = 'Not supported by R2 - unaligned', notLow = 'Not supported by R2 - R2 alignment score too low';
 	const supLabels = [sup, notOri, notDist, notChr, notAln, notLow];
 
-	const seen = new Map(); let seenCounts = new Map();
+	// UMI/position keys: count + first read name (CRISPRuno's seen_reads_for_dedup dicts), compact for millions of reads
+	let seenCounts = new C.StrMap(1, true);
 	let totalReads = 0, totalR1 = 0, dUnaligned = 0, dDup = 0, dPoor = 0, dR2 = 0;
 	const cutPointsByChr = new Map();
-	const cp = (chr) => { if (!cutPointsByChr.has(chr)) cutPointsByChr.set(chr, new DefaultInt()); return cutPointsByChr.get(chr); };
+	const cp = (chr) => { if (!cutPointsByChr.has(chr)) cutPointsByChr.set(own(chr), new DefaultInt()); return cutPointsByChr.get(chr); };
 	const tlens = new DefaultInt(), chrCounts = new DefaultInt(), supDist = new DefaultInt(), notSupDist = new DefaultInt();
 	const discardedName = R + '.discarded_read_info.txt';
 	const fd = P.writeDiscarded ? await io.writer(discardedName) : null;
@@ -159,19 +160,19 @@ async function makeFinalReadAssignments(ctx) {
 			let best = null, bestD = Infinity;
 			for (const p of prio) if (p[0] === chr) { const d = Math.abs(parseInt(p[1], 10) - pos); if (d < bestD) { bestD = d; best = p; } }
 			const M = isR2 ? mmAS2 : mmAS1, cur = M.get(f[0]);
-			if (!cur) M.set(f[0], [as, bestD, line]);
-			else if (as > cur[0] || (as === cur[0] && bestD < cur[1])) M.set(f[0], [as, bestD, line]);
-			if (!mmAssign.has(f[0])) mmAssign.set(f[0], [chr, pos, bestD, sec]);
+			if (!cur) M.set(own(f[0]), [as, bestD, own(line)]);
+			else if (as > cur[0] || (as === cur[0] && bestD < cur[1])) M.set(f[0], [as, bestD, own(line)]);
+			if (!mmAssign.has(f[0])) mmAssign.set(own(f[0]), [own(chr), pos, bestD, sec]);
 			else {
 				const o = mmAssign.get(f[0]);
-				if (best !== null) { if (o[2] === -1) mmAssign.set(f[0], [chr, pos, bestD, sec]); else if (bestD < o[2]) mmAssign.set(f[0], [chr, pos, bestD, sec]); }
-				else if (o[2] === -1 && !sec) mmAssign.set(f[0], [chr, pos, -1, sec]);
+				if (best !== null) { if (o[2] === -1) mmAssign.set(f[0], [own(chr), pos, bestD, sec]); else if (bestD < o[2]) mmAssign.set(f[0], [own(chr), pos, bestD, sec]); }
+				else if (o[2] === -1 && !sec) mmAssign.set(f[0], [own(chr), pos, -1, sec]);
 			}
 		}
 	}
 	let mmSecUsed = 0, mmSkipped = 0;
 	// R2 info
-	const r2Info = new Map();
+	let r2Info = new C.StrMap(3); // R2 read name -> [unmapped flag, MAPQ, NM (-1 = None)]
 	for (const line of io.sam()) {
 		const f = line.split('\t'), fl = +f[1];
 		if (!(fl & 0x80)) continue;
@@ -180,7 +181,7 @@ async function makeFinalReadAssignments(ctx) {
 		}
 		const q = parseInt(f[4], 10);
 		let nm = null; for (const x of f) if (x.startsWith('NM:i')) { nm = parseInt(x.slice(5), 10); break; }
-		r2Info.set(f[0].split(' ')[0], [fl & 0x4, q, nm]);
+		{ const k = f[0].split(' ')[0]; let i = r2Info.find(k); if (i < 0) i = r2Info.insert(k); r2Info.setV(i, 0, fl & 0x4); r2Info.setV(i, 1, q); r2Info.setV(i, 2, nm === null ? -1 : nm); }
 		totalReads += 1;
 	}
 	const supCounts = new DefaultInt();
@@ -231,7 +232,7 @@ async function makeFinalReadAssignments(ctx) {
 		const alnPos = `${chr}:${start}-${end}`, cutPos = `${chr}:${start}`;
 		const delPrimer = origin_seq.length - primerLen, insTarget = startClipped;
 		let status = null, dist = null, ori = null;
-		const [, r2Q, r2NM] = r2Info.get(f[0].split(' ')[0]) || [null, null, null];
+		const ri = r2Info.find(f[0].split(' ')[0]), r2Q = ri < 0 ? null : r2Info.v(ri, 1), r2NM = ri < 0 || r2Info.v(ri, 2) === -1 ? null : r2Info.v(ri, 2);
 		if (isR1) {
 			const o1 = isRc ? '-' : '+', c2 = f[6], o2 = (fl & 0x20) ? '-' : '+';
 			dist = Math.abs(parseInt(f[8], 10));
@@ -249,10 +250,11 @@ async function makeFinalReadAssignments(ctx) {
 		const tlen = Math.abs(parseInt(f[8], 10));
 		let key = `b:${barcode} 1:${f[2]}:${f[3]} 2:${f[6]}:${f[7]} t:${tlen} dp:${delPrimer} it:${insTarget}`;
 		if (experiment_had_UMIs) {
-			if (seen.has(key)) {
-				seenCounts.set(key, seenCounts.get(key) + 1);
-				if (!(P.suppressDedup || P.dedupFinal)) { dDup += 1; if (fd) fd.write(f[0] + '\tDuplicate\tDuplicate of ' + seen.get(key) + '(' + key + ')\n'); continue; }
-			} else { seen.set(key, f[0]); seenCounts.set(key, 1); }
+			const si = seenCounts.find(key);
+			if (si >= 0) {
+				seenCounts.setV(si, 0, seenCounts.v(si) + 1);
+				if (!(P.suppressDedup || P.dedupFinal)) { dDup += 1; if (fd) fd.write(f[0] + '\tDuplicate\tDuplicate of ' + seenCounts.aux(si) + '(' + key + ')\n'); continue; }
+			} else seenCounts.setV(seenCounts.insert(key, f[0]), 0, 1);
 		} else key = '(None)';
 		cp(chr).inc(start);
 		let insertSize = 'None';
@@ -261,6 +263,7 @@ async function makeFinalReadAssignments(ctx) {
 		tmp.write([lineInfo, alnPos, cutPos, dir, delPrimer, insTarget, insertSize, status, dist, ori, q, nm, r2Q, r2NM, key].map(str).join('\t') + '\n');
 	}
 	tmp.close();
+	r2Info = null;
 	let tmpLines = () => io.linesOf(tmp);
 	log('Finished first pass through alignments');
 
@@ -373,7 +376,7 @@ async function makeFinalReadAssignments(ctx) {
 	let totalForDedup = totalR1;
 	if (experiment_had_UMIs && P.dedupFinal) {
 		log('Deduplicating based on final cut assignments');
-		const seen2 = new Map(); seenCounts = new Map();
+		seenCounts = new C.StrMap(1, true);
 		let readN = 0, printed = 0; dDup = 0;
 		const dt = await io.writer(R + '.final_assignments.dedup.tmp');
 		let first = true;
@@ -383,8 +386,9 @@ async function makeFinalReadAssignments(ctx) {
 			const e = l.split('\t');
 			const fcp = lookup.get(e[2]);
 			const k = `${e[0].split(':').pop()} ${fcp} ${e[3]}`;
-			if (seen2.has(k)) { seenCounts.set(k, seenCounts.get(k) + 1); dDup += 1; if (fd) fd.write(e[0] + '\tDuplicate\tDuplicate of ' + seen2.get(k) + '(' + k + ')\n'); continue; }
-			seen2.set(k, e[0]); seenCounts.set(k, 1);
+			const si = seenCounts.find(k);
+			if (si >= 0) { seenCounts.setV(si, 0, seenCounts.v(si) + 1); dDup += 1; if (fd) fd.write(e[0] + '\tDuplicate\tDuplicate of ' + seenCounts.aux(si) + '(' + k + ')\n'); continue; }
+			seenCounts.setV(seenCounts.insert(k, e[0]), 0, 1);
 			e[14] = k; dt.write(e.join('\t') + '\n'); printed += 1;
 		}
 		dt.close(); tmpLines = () => io.linesOf(dt);
@@ -396,7 +400,7 @@ async function makeFinalReadAssignments(ctx) {
 	// final assignments
 	const finalName = R + '.final_assignments.txt';
 	let finalTotal = 0;
-	const clsCounts = new DefaultInt(), clsIndelCounts = new DefaultInt(), readIds = new Map(), cutCounts = new DefaultInt();
+	const clsCounts = new DefaultInt(), clsIndelCounts = new DefaultInt(), cutCounts = new DefaultInt(); // (read ids for CRISPResso are collected in the crispresso step)
 	const oppositeDir = originDirection === 'left' ? 'right' : 'left';
 	const indelLens = new DefaultInt(), invLens = new DefaultInt(), delLens = new DefaultInt();
 	const LONG = 100000, oLen = origin_seq.length;
@@ -420,7 +424,6 @@ async function makeFinalReadAssignments(ctx) {
 		const delPrimer = parseInt(e[4], 10), insTarget = parseInt(e[5], 10);
 		const indel = insTarget - delPrimer - alnIndel;
 		cutCounts.inc(fcd);
-		if (Math.abs(indel) <= P.crispresso_max_indel_size) readIds.set(e[0], fcd);
 		if (!cls.has(fcd)) throw new Error(`KeyError: '${fcd}'`);
 		const fc = cls.get(fcd);
 		clsCounts.inc(fc);
@@ -428,7 +431,7 @@ async function makeFinalReadAssignments(ctx) {
 		if (Math.abs(indel) > 0) indelStr = Math.abs(indel) > P.short_indel_length_cutoff ? 'long indels' : 'short indels';
 		clsIndelCounts.inc(fc + ' ' + indelStr);
 		let nSeen = 1;
-		if (experiment_had_UMIs) { nSeen = seenCounts.get(e[14]); if (nSeen === undefined) throw new Error(`KeyError: '${e[14]}'`); dedupSum.inc(fc + ' ' + indelStr, nSeen); }
+		if (experiment_had_UMIs) { const si = seenCounts.find(e[14]); if (si < 0) throw new Error(`KeyError: '${e[14]}'`); nSeen = seenCounts.v(si); dedupSum.inc(fc + ' ' + indelStr, nSeen); }
 		else dedupSum.inc(fc + ' ' + indelStr, 1);
 		dedupCnt.inc(fc + ' ' + indelStr);
 		fw.write([...e.slice(0, 15), nSeen, fcd, indel, indelStr, fc].join('\t') + '\n');
@@ -627,7 +630,7 @@ async function makeFinalReadAssignments(ctx) {
 		[totalReads, mmSkipped, mmSecUsed, totalR1, dUnaligned, dDup, dR2, dPoor, finalTotal, col.found, finalCutTotal].join('\t') + '\n' +
 		clsStr + clsIndelStr + pyJson(cls) + '\n' + JSON.stringify(plots.filter(Boolean).map((p) => ({ name: p.name, title: p.title, label: p.label, datas: p.datas, order: p.order, plot: p.plot }))) + '\n');
 	return {
-		finalName, readIds, cutCounts, cls, finalTotal,
+		finalName, cutCounts, cls, finalTotal,
 		discarded: [['Unaligned', dUnaligned], ['Duplicate read', dDup], ['Not supported by R2', dR2], ['Bad alignment', dPoor]],
 		clsCounts: clsLabels.map((l, i) => [l, clsValues[i]]), clsIndelCounts: clsIndelLabels.map((l, i) => [l, clsIndelValues[i]]),
 		plots: plots.filter(Boolean), originChr, originCutPos, originDirection,

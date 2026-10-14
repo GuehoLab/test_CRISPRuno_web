@@ -34,8 +34,73 @@ function str(v) {
 function pctStr(x) { return pyFloat((root.CuAlign || require('./cralign.js')).pyRound(x, 2)); }
 
 /* defaultdict(int) with Python's insertion-on-read semantics */
+/* A substring (split/slice) of a long string can keep the whole parent alive in V8 (sliced strings), e.g. a read name
+ * from IO.lines() retains the 8 MB text chunk it was cut from. Strings kept for the whole step (Map keys/values) are
+ * copied with own(); intern() also shares one copy among equal values (chromosome names, cut keys). */
+const own = (s) => (typeof s === 'string' && s.length > 12 ? (' ' + s).slice(1) : s);
+function makeIntern() { const m = new Map(); return (s) => { let v = m.get(s); if (v === undefined) { v = own(s); m.set(v, v); } return v; }; }
+/* Compact string-keyed hash map for millions of keys (read names, UMI/position keys): the key bytes live in 64 MB
+ * arena blocks and the entries in typed arrays (~keyLength + 30 bytes per entry, vs ~300+ for a Map of strings).
+ * Each entry has nVals int32 values and optionally one auxiliary string. Iteration is in insertion order. */
+class StrMap {
+	constructor(nVals = 1, withAux = false) {
+		this.nVals = nVals; this.withAux = withAux; this.size = 0; this.cap = 0;
+		this.blocks = []; this.bpos = 0; this.BLK = 64 << 20;
+		this.koff = null; this.klen = null; this.vals = null; this.aoff = null; this.alen = null;
+		this.mask = 1023; this.table = new Int32Array(1024).fill(-1);
+		this.buf = new Uint8Array(1 << 16); this.enc = new TextEncoder(); this.dec = new TextDecoder();
+		this._grow(1024);
+	}
+	_grow(n) {
+		const g = (A, old, k = 1) => { const a = new A(n * k); if (old) a.set(old); return a; };
+		this.koff = g(Float64Array, this.koff); this.klen = g(Int32Array, this.klen); this.vals = g(Int32Array, this.vals, this.nVals);
+		if (this.withAux) { this.aoff = g(Float64Array, this.aoff); this.alen = g(Int32Array, this.alen); }
+		this.cap = n;
+	}
+	_bytes(s) { // UTF-8 bytes of s in this.buf (returns length)
+		const n = s.length;
+		if (n * 3 > this.buf.length) this.buf = new Uint8Array(n * 3 + 16);
+		const b = this.buf;
+		for (let i = 0; i < n; ++i) { const c = s.charCodeAt(i); if (c > 127) return this.enc.encodeInto(s, b).written; b[i] = c; }
+		return n;
+	}
+	_hash(n) { let h = 0x811c9dc5; const b = this.buf; for (let i = 0; i < n; ++i) h = Math.imul(h ^ b[i], 16777619); return h >>> 0; }
+	_store(n) { // copy this.buf[0, n) into the arena -> global offset
+		if (!this.blocks.length || this.bpos + n > this.BLK) { this.blocks.push(new Uint8Array(Math.max(this.BLK, n))); this.bpos = 0; }
+		const bi = this.blocks.length - 1; this.blocks[bi].set(this.buf.subarray(0, n), this.bpos);
+		const off = bi * this.BLK + this.bpos; this.bpos += n; return off;
+	}
+	_eq(i, n) { const off = this.koff[i]; if (this.klen[i] !== n) return false; const blk = this.blocks[Math.floor(off / this.BLK)], o = off % this.BLK, b = this.buf; for (let k = 0; k < n; ++k) if (blk[o + k] !== b[k]) return false; return true; }
+	_str(off, n) { const blk = this.blocks[Math.floor(off / this.BLK)], o = off % this.BLK; return this.dec.decode(blk.subarray(o, o + n)); }
+	find(s) { const n = this._bytes(s); let h = this._hash(n) & this.mask; for (;;) { const i = this.table[h]; if (i < 0) return -1; if (this._eq(i, n)) return i; h = (h + 1) & this.mask; } }
+	has(s) { return this.find(s) >= 0; }
+	insert(s, aux) { // s must not be present; returns the entry index
+		if ((this.size + 1) * 2 > this.mask + 1) this._rehash((this.mask + 1) * 2);
+		if (this.size === this.cap) this._grow(this.cap * 2);
+		const i = this.size++;
+		const n = this._bytes(s); let h = this._hash(n) & this.mask;
+		while (this.table[h] >= 0) h = (h + 1) & this.mask;
+		this.table[h] = i; this.koff[i] = this._store(n); this.klen[i] = n;
+		if (this.withAux) { const m = this._bytes(aux === undefined ? '' : String(aux)); this.aoff[i] = this._store(m); this.alen[i] = m; }
+		return i;
+	}
+	_rehash(sz) {
+		const t = new Int32Array(sz).fill(-1), mask = sz - 1;
+		for (let i = 0; i < this.size; ++i) {
+			const off = this.koff[i], n = this.klen[i], blk = this.blocks[Math.floor(off / this.BLK)], o = off % this.BLK;
+			let h = 0x811c9dc5; for (let k = 0; k < n; ++k) h = Math.imul(h ^ blk[o + k], 16777619);
+			h = (h >>> 0) & mask; while (t[h] >= 0) h = (h + 1) & mask; t[h] = i;
+		}
+		this.table = t; this.mask = mask;
+	}
+	v(i, j = 0) { return this.vals[i * this.nVals + j]; }
+	setV(i, j, x) { this.vals[i * this.nVals + j] = x; }
+	key(i) { return this._str(this.koff[i], this.klen[i]); }
+	aux(i) { return this._str(this.aoff[i], this.alen[i]); }
+	*values(j = 0) { for (let i = 0; i < this.size; ++i) yield this.vals[i * this.nVals + j]; }
+}
 class DefaultInt extends Map {
-	get(k) { if (!super.has(k)) super.set(k, 0); return super.get(k); }
+	get(k) { if (!super.has(k)) { super.set(own(k), 0); } return super.get(k); }
 	peek(k) { return super.has(k) ? super.get(k) : 0; } // .get() without inserting (dict.get(k, 0))
 	inc(k, n = 1) { super.set(k, this.get(k) + n); }
 }
@@ -78,7 +143,7 @@ function faidx(genome, chr, start, end) {
 }
 
 const base = (p) => String(p).split(/[\\/]/).pop();
-const api = { revcomp, revcompShared, strip, rstripNl, findWrongNt, str, F, PyF, pctStr, DefaultInt, pyJson, PlotObject, read4, faidx, base, pyFloat };
+const api = { own, makeIntern, StrMap, revcomp, revcompShared, strip, rstripNl, findWrongNt, str, F, PyF, pctStr, DefaultInt, pyJson, PlotObject, read4, faidx, base, pyFloat };
 if (typeof module !== 'undefined' && module.exports) module.exports = api;
 root.CuCore = api;
 })(typeof self !== 'undefined' ? self : globalThis);

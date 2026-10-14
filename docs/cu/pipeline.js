@@ -224,7 +224,8 @@ async function stepAssign(io, S) {
 	const genome = S.suppress_homology_detection ? null : await io.getGenome();
 	const r = await AS.makeFinalReadAssignments({ io: { ...io, sam }, S, genome, origin_seq: P.origin_seq, cut_sites: P.cut_sites, cut_annotations: P.cut_annotations,
 		experiment_had_UMIs: !!st.experiment_had_UMIs, log: io.log, progress: (k) => io.progress({ reads: k, label: 'assign' }), root: S.root + '.final', regionLines, keepIntermediate: S.keep_intermediate });
-	if (!S.keep_intermediate) await io.remove(S.root + '.genomeAlignment.sam');
+	// (CRISPRuno deletes the alignment here unless keep_intermediate; the web version keeps it in the run folder so the
+	// assign step can be re-run with other filter settings without aligning again. 'Delete run' frees the space.)
 	return { final: r.finalTotal, classes: r.clsCounts };
 }
 
@@ -237,14 +238,15 @@ async function stepCrispresso(io, S, { ednafull, fixSpaceIds }) {
 	const IO = root.GsIO || require('../lib/textio.js');
 	const lines = function* () { for (const l of IO.lines(fsrc)) if (l.length) yield l; };
 	// as CRISPRuno rebuilds them from a finished final_assignments file
-	const readIds = new Map(), cutCounts = new C.DefaultInt();
+	const ids = new C.StrMap(1), cuts = [], cutIdx = new Map(), cutCounts = new C.DefaultInt(); // read name -> index of its final cut key
 	let first = true;
 	for (const l of lines()) {
 		if (first) { first = false; continue; }
 		const e = l.split('\t');
 		cutCounts.inc(e[16]);
-		if (Math.abs(parseInt(e[17], 10)) <= S.crispresso_max_indel_size) readIds.set(e[0], e[16]);
+		if (Math.abs(parseInt(e[17], 10)) <= S.crispresso_max_indel_size) { let c = cutIdx.get(e[16]); if (c === undefined) { c = cuts.length; cuts.push(C.own(e[16])); cutIdx.set(cuts[c], c); } let i = ids.find(e[0]); if (i < 0) i = ids.insert(e[0]); ids.setV(i, 0, c); }
 	}
+	const readIds = { get: (k) => { const i = ids.find(k); return i < 0 ? undefined : cuts[ids.v(i)]; } };
 	const info = (await io.readText(S.root + '.final.info')).split('\n');
 	const cls = new Map(Object.entries(JSON.parse(info[6])));
 	log('Preparing reads for analysis by CRISPResso2');

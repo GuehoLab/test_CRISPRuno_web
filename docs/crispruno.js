@@ -132,13 +132,27 @@ async function stepAlign(run, S, idx, cfg) {
 	const inputs = {};
 	for (const n of st.aligned_inputs) { const f = await fileIn(dir, n); if (!f) throw new Error(n + ' not found — re-run the primer step'); inputs[n] = f; }
 	const job = `${run}.genome`;
-	try { await (await jobsTop()).removeEntry(job, { recursive: true }); } catch (_) {}
 	const args = [...splitOpts($('opts').value), '-b', 'MD'];
 	if (S.analyze_multimap_assignments) args.push(`--outn=${Math.max(0, S.max_multimap_alignments - 1)}`);
-	const t0 = performance.now();
-	const r = await runAlign({ job, inputs, reads: st.aligned_inputs, args, idx, batch: Math.max(1000, parseInt($('batch').value, 10) || 20000), label: 'align' });
-	const alignerLog = `\nAligning ${st.aligned_inputs.length === 2 ? 'paired' : 'single-end'} reads\n===\nCommand used:\n===\nminibwa map ${args.join(' ')} ${idx.name} ${st.aligned_inputs.join(' ')} (WebAssembly, ${r.wasm})\n===\nOutput:\n===\n${fmtInt(r.records)} SAM records in ${fmtSec((performance.now() - t0) / 1000)}\n`;
-	log(`[align] ${fmtInt(r.records)} records, index load ${fmtSec(r.loadSec)}, mapping ${fmtSec(r.mapSec)}`, 'ok');
+	const batch = Math.max(1000, parseInt($('batch').value, 10) || 20000);
+	// a finished alignment of the same inputs/options is kept in OPFS until the sort succeeds, so it is reused
+	// (e.g. after the sort failed or was cancelled) instead of mapping again
+	const sig = JSON.stringify({ args, index: idx.name, batch, reads: st.aligned_inputs.map((n) => [n, inputs[n].size, inputs[n].lastModified]) });
+	let done = null;
+	try { const jd = await (await jobsTop()).getDirectoryHandle(job); done = JSON.parse(await (await (await jd.getFileHandle('done.json')).getFile()).text()); } catch (_) {}
+	let alignerLog;
+	if (done && done.sig === sig) {
+		log(`[align] reusing the alignment kept in browser storage (${fmtInt(done.records)} records, ${done.date}); delete the run or change an option to align again`, 'ok');
+		alignerLog = done.alignerLog;
+	} else {
+		try { await (await jobsTop()).removeEntry(job, { recursive: true }); } catch (_) {}
+		const t0 = performance.now();
+		const r = await runAlign({ job, inputs, reads: st.aligned_inputs, args, idx, batch, label: 'align' });
+		alignerLog = `\nAligning ${st.aligned_inputs.length === 2 ? 'paired' : 'single-end'} reads\n===\nCommand used:\n===\nminibwa map ${args.join(' ')} ${idx.name} ${st.aligned_inputs.join(' ')} (WebAssembly, ${r.wasm})\n===\nOutput:\n===\n${fmtInt(r.records)} SAM records in ${fmtSec((performance.now() - t0) / 1000)}\n`;
+		log(`[align] ${fmtInt(r.records)} records, index load ${fmtSec(r.loadSec)}, mapping ${fmtSec(r.mapSec)}`, 'ok');
+		const jd = await (await jobsTop()).getDirectoryHandle(job);
+		await writeText(jd, 'done.json', JSON.stringify({ sig, records: r.records, date: new Date().toISOString().slice(0, 19).replace('T', ' '), alignerLog }));
+	}
 	return runWorker('sort', run, { ...cfg, jobsDir: 'cu-jobs', job, alignerLog });
 }
 
@@ -242,6 +256,7 @@ $('btn-del-run').addEventListener('click', async () => {
 	const run = $('run-sel').value;
 	if (!run || busy || !confirm(`Delete all files of run "${run}"?`)) return;
 	await (await cuTop()).removeEntry(run, { recursive: true });
+	for (const j of ['.genome', '.locate']) { try { await (await jobsTop()).removeEntry(run + j, { recursive: true }); } catch (_) {} } // kept alignment
 	await refreshRuns(); checkEnv();
 });
 

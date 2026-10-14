@@ -18,6 +18,7 @@ async function runDir(run) { return (await (await (await topDir()).getDirectoryH
 function makeIo(dir, cfg) {
 	const handles = new Map(); // name -> SyncAccessHandle (kept open until the end of the step)
 	const extra = []; // other handles (tmp files, index .l2b)
+	const tmpH = new Map(); // tmp file name -> handle
 	const closeName = (name) => { const h = handles.get(name); if (h) { try { h.flush(); h.close(); } catch (_) {} handles.delete(name); } };
 	const getH = async (name, create) => {
 		if (handles.has(name)) return handles.get(name);
@@ -65,12 +66,15 @@ function makeIo(dir, cfg) {
 		tmp: {
 			async create(name) {
 				const td = await dir.getDirectoryHandle('tmp', { create: true });
-				const h = await syncHandle(await td.getFileHandle(name, { create: true })); extra.push(h); h.truncate(0);
+				const h = await syncHandle(await td.getFileHandle(name, { create: true })); extra.push(h); tmpH.set(name, h); h.truncate(0);
 				let at = 0;
 				return { write: (u8) => { h.write(u8, { at }); at += u8.length; }, close: () => { h.flush(); return IO.handleSource(h); } };
 			},
-			async remove(name) {
-				for (let i = extra.length - 1; i >= 0; --i) { /* closed with the others at the end */ }
+			async remove(name) { // close and delete a temporary file now (frees OPFS space during the step)
+				const h = tmpH.get(name); if (!h) return;
+				tmpH.delete(name); const i = extra.indexOf(h); if (i >= 0) extra.splice(i, 1);
+				try { h.close(); } catch (_) {}
+				try { await (await dir.getDirectoryHandle('tmp')).removeEntry(name); } catch (_) {}
 			},
 		},
 		log, progress,
@@ -101,11 +105,12 @@ const STEPS = {
 	primer: async (io, S) => PL.stepPrimer(io, S, { ssw: await CuSsw.load('cu/ssw.wasm') }),
 	sort: async (io, S, cfg) => {
 		const { headerText, sources } = await readChunks(io, cfg.jobsDir, cfg.job);
-		try { return await PL.stepSortAlignment(io, S, { headerText, sources, alignerLog: cfg.alignerLog }); }
-		finally {
-			for (const h of io._chunkHandles || []) { try { h.close(); } catch (_) {} }
-			try { await (await (await topDir()).getDirectoryHandle(cfg.jobsDir)).removeEntry(cfg.job, { recursive: true }); } catch (_) {}
-		}
+		let r;
+		try { r = await PL.stepSortAlignment(io, S, { headerText, sources, alignerLog: cfg.alignerLog }); }
+		finally { for (const h of io._chunkHandles || []) { try { h.close(); } catch (_) {} } }
+		// the alignment chunks are removed only after a successful sort (otherwise the next run of the step reuses them)
+		try { await (await (await topDir()).getDirectoryHandle(cfg.jobsDir)).removeEntry(cfg.job, { recursive: true }); } catch (_) {}
+		return r;
 	},
 	assign: (io, S) => PL.stepAssign(io, S),
 	crispresso: async (io, S, cfg) => PL.stepCrispresso(io, S, { ednafull: await (await fetch('cu/EDNAFULL')).text(), fixSpaceIds: !!cfg.fixSpaceIds }),
