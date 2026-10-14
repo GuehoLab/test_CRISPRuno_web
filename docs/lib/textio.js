@@ -332,7 +332,8 @@ class L2bGenome {
 		const g0 = r.off + a, g1 = r.off + b;
 		const b0 = Math.floor(g0 / 4), bytes = this.src.read(this.pacOff + b0, Math.floor((g1 - 1) / 4) - b0 + 1);
 		const s = new Array(g1 - g0);
-		for (let g = g0; g < g1; ++g) s[g - g0] = 'ACGT'[(bytes[(g >> 2) - b0] >> ((g & 3) * 2)) & 3];
+		// offsets relative to byte b0 (genome coordinates can exceed 2^31, where >> and & would wrap)
+		for (let d = g0 - b0 * 4, i = 0; i < g1 - g0; ++i, ++d) s[i] = 'ACGT'[(bytes[d >> 2] >> ((d & 3) * 2)) & 3];
 		for (const [x, y] of this.overlapping(this.ambiOff, this.nAmbi, g0, g1)) for (let g = Math.max(x, g0); g < Math.min(y, g1); ++g) s[g - g0] = 'N';
 		for (const [x, y] of this.overlapping(this.maskOff, this.nMask, g0, g1)) for (let g = Math.max(x, g0); g < Math.min(y, g1); ++g) s[g - g0] = s[g - g0].toLowerCase();
 		return s.join('');
